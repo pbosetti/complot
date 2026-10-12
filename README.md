@@ -12,6 +12,19 @@ tail -f log.csv | complot $h -              # stream stdin, live
 complot $h --close
 ```
 
+## Install
+
+| Platform | Command |
+|---|---|
+| macOS, Linux (Homebrew) | `brew install pbosetti/mads/complot` |
+| Debian, Ubuntu | download the `.deb` from the [releases](https://github.com/pbosetti/complot/releases), then `sudo apt install ./complot_*.deb` |
+| Windows | `winget install PaoloBosetti.complot` |
+| From source | `cargo install --git https://github.com/pbosetti/complot` |
+
+Archives for every platform are on the releases page too. `complot -V` prints
+the version; `complot --version` adds the build target. Maintainers: see
+[DEPLOY.md](DEPLOY.md).
+
 ## Usage
 
 ```
@@ -129,6 +142,11 @@ says when decimation is active (`drawing N of M`).
 ```sh
 cargo build --release   # binary: target/release/complot
 ```
+
+The version comes from the nearest `vX.Y.Z` git tag (`0.2.0`, or
+`0.2.0-3-gabc1234` three commits later, `-dirty` with local changes), or from
+Cargo.toml when there is no tag or no git; `COMPLOT_VERSION=1.2.3` at build
+time overrides it.
 
 Plots are registered in a per-user directory (`$XDG_RUNTIME_DIR` or the
 system temp dir, under `complot-$USER`; override with `COMPLOT_DIR`), which

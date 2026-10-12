@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+
+PackageIdentifier: PaoloBosetti.complot
+PackageVersion: "@VERSION@"
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: complot.exe
+    PortableCommandAlias: complot
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/pbosetti/complot/releases/download/v@VERSION@/complot-v@VERSION@-x86_64-pc-windows-msvc.zip
+    InstallerSha256: "@SHA256_ZIP@"
+ManifestType: installer
+ManifestVersion: 1.6.0

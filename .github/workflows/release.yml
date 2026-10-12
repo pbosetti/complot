@@ -1,0 +1,251 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that the tag matches the Cargo.toml version
+        id: check
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "::error::Could not read the package version from Cargo.toml."
+            exit 1
+          fi
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' does not match the Cargo.toml version '$version'. Expected the tag 'v$version'. Bump Cargo.toml or push the matching tag."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing complot $version"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 is used for its older glibc (2.35), so the binaries and
+          # .debs run on more distributions. When GitHub retires this image,
+          # move both Linux rows to ubuntu-24.04 / ubuntu-24.04-arm (glibc 2.39).
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            native: true
+            deb: true
+          # Native arm64 runner (hosted arm runners are free for public repositories).
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            native: true
+            deb: true
+          # Cross-compiled on an arm64 runner, so it is neither tested nor run here.
+          - target: x86_64-apple-darwin
+            os: macos-14
+            native: false
+            deb: false
+          - target: aarch64-apple-darwin
+            os: macos-14
+            native: true
+            deb: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            native: true
+            deb: false
+    env:
+      COMPLOT_VERSION: ${{ needs.version.outputs.version }}
+      RELEASE_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev
+      - name: Build
+        run: cargo build --release --locked --target "$RELEASE_TARGET"
+      - name: Test
+        if: matrix.native
+        run: cargo test --release --locked --target "$RELEASE_TARGET"
+      - name: Smoke check (-V must report the release version)
+        if: matrix.native
+        run: |
+          bin="target/$RELEASE_TARGET/release/complot"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bin="$bin.exe"
+          fi
+          out=$("$bin" -V)
+          echo "$out"
+          case "$out" in
+            *"$COMPLOT_VERSION"*) ;;
+            *)
+              echo "::error::'$bin -V' does not report version $COMPLOT_VERSION."
+              exit 1
+              ;;
+          esac
+      - name: Package (Unix tarball)
+        if: runner.os != 'Windows'
+        run: |
+          stage=stage
+          archive="complot-v$COMPLOT_VERSION-$RELEASE_TARGET.tar.gz"
+          rm -rf "$stage"
+          mkdir -p "$stage" dist
+          cp "target/$RELEASE_TARGET/release/complot" README.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          # COPYFILE_DISABLE stops macOS tar from adding AppleDouble "._" entries.
+          (cd "$stage" && COPYFILE_DISABLE=1 tar -czf "../dist/$archive" complot README.md LICENSE-MIT LICENSE-APACHE)
+          rm -rf "$stage"
+      - name: Package (Windows zip)
+        if: runner.os == 'Windows'
+        run: |
+          stage=stage
+          archive="complot-v$COMPLOT_VERSION-$RELEASE_TARGET.zip"
+          rm -rf "$stage"
+          mkdir -p "$stage" dist
+          cp "target/$RELEASE_TARGET/release/complot.exe" README.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          (cd "$stage" && 7z a -tzip "../dist/$archive" complot.exe README.md LICENSE-MIT LICENSE-APACHE)
+          rm -rf "$stage"
+      - name: Install cargo-deb
+        if: matrix.deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - name: Build .deb
+        if: matrix.deb
+        run: |
+          mkdir -p dist
+          cargo deb --no-build --target "$RELEASE_TARGET"
+          cp "target/$RELEASE_TARGET"/debian/*.deb dist/
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          merge-multiple: true
+          path: dist
+      - name: Compute SHA256SUMS.txt
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Upload checksums for the Homebrew job
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/SHA256SUMS.txt
+          if-no-files-found: error
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          token: ${{ github.token }}
+          # Tags such as v0.2.0-rc.1 become pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  homebrew:
+    name: Homebrew tap
+    needs: [version, release]
+    # Pre-releases (tags such as v0.2.0-rc.1) stay on the release page only.
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Skip notice
+        if: env.HOMEBREW_TAP_TOKEN == ''
+        run: echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the Homebrew tap update."
+      - name: Check out complot (for the formula template)
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        uses: actions/checkout@v4
+      - name: Download checksums
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: checksums
+          path: dist
+      - name: Render the formula
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          sh packaging/homebrew/render-formula.sh "$VERSION" dist/SHA256SUMS.txt > complot.rb
+          ruby -c complot.rb
+      - name: Check out the tap
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        uses: actions/checkout@v4
+        with:
+          repository: pbosetti/homebrew-mads
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Commit and push the formula
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p tap/Formula
+          mv complot.rb tap/Formula/complot.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/complot.rb
+          if git diff --cached --quiet; then
+            echo "Formula is already up to date."
+            exit 0
+          fi
+          git commit -m "complot $VERSION"
+          git push
+
+  winget:
+    name: winget
+    needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - name: Skip notice
+        if: env.WINGET_TOKEN == ''
+        run: echo "::notice::WINGET_TOKEN is not set; skipping the winget update."
+      # Works only after the first version has been accepted into
+      # microsoft/winget-pkgs by hand (see DEPLOY.md). The token needs a fork
+      # of microsoft/winget-pkgs under pbosetti.
+      - name: Submit the release to microsoft/winget-pkgs
+        if: env.WINGET_TOKEN != ''
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: PaoloBosetti.complot
+          release-tag: ${{ github.ref_name }}
+          installers-regex: '\.zip$'
+          token: ${{ secrets.WINGET_TOKEN }}

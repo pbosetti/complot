@@ -23,7 +23,8 @@ use std::process::ExitCode;
 #[derive(Parser, Debug)]
 #[command(
   name = "complot",
-  version,
+  version = env!("COMPLOT_VERSION"),
+  long_version = concat!(env!("COMPLOT_VERSION"), "\ntarget: ", env!("COMPLOT_TARGET")),
   about = "Real-time plots from the shell",
   allow_negative_numbers = true
 )]
@@ -104,4 +105,16 @@ fn main() -> ExitCode {
     };
   }
   client::run(&cli)
+}
+
+#[cfg(test)]
+mod tests {
+  #[test]
+  fn version_starts_with_digit() {
+    let v = env!("COMPLOT_VERSION");
+    assert!(
+      v.chars().next().is_some_and(|c| c.is_ascii_digit()),
+      "COMPLOT_VERSION must start with a digit, got {v:?}"
+    );
+  }
 }
