@@ -1,0 +1,24 @@
+# Build output (Cargo.lock is kept: this is a binary crate)
+/target
+
+# rustfmt backups
+**/*.rs.bk
+
+# MSVC debug info on Windows
+*.pdb
+
+# Profiling and coverage output
+*.profraw
+*.profdata
+/perf.data*
+flamegraph.svg
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
