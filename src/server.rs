@@ -161,11 +161,11 @@ pub fn handle_connection<R: BufRead, W: Write>(
         }
         rejected += batch.rejected;
       }
-      Msg::Point { x, y, g } => {
-        {
+      Msg::Point { x, y, z, g } => {
+        let result = {
           let mut st = lock(state);
           let before = accepted_so_far(&st);
-          st.push_point(g.as_deref().unwrap_or("y"), x, y);
+          let result = st.push_point(g.as_deref().unwrap_or("y"), x, y, z);
           added += (accepted_so_far(&st) - before) as u64;
           if st.x_label.is_empty() {
             let label = if x.is_none() { "index" } else { "x" };
@@ -174,8 +174,15 @@ pub fn handle_connection<R: BufRead, W: Write>(
           if st.y_label.is_empty() {
             st.y_label = "y".to_string();
           }
-        }
+          if z.is_some() && st.z_label.is_empty() {
+            st.z_label = "z".to_string();
+          }
+          result
+        };
         repaint();
+        if let Err(e) = result {
+          reply(&mut writer, &format!("{ERROR}{e}\n"));
+        }
       }
       Msg::SetAes { aes } => {
         lock(state).set_aes(aes);
@@ -188,6 +195,13 @@ pub fn handle_connection<R: BufRead, W: Write>(
       Msg::Clear => {
         lock(state).clear();
         repaint();
+      }
+      Msg::SetType { plot_type, group } => {
+        let result = lock(state).set_type(plot_type, group.as_deref());
+        match result {
+          Ok(()) => repaint(),
+          Err(e) => reply(&mut writer, &format!("{ERROR}{e}\n")),
+        }
       }
       Msg::Close => {
         // Unregister before the client gets our EOF, so that a `--list` or a
@@ -260,7 +274,7 @@ fn lock(state: &Mutex<PlotState>) -> MutexGuard<'_, PlotState> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::model::Aes;
+  use crate::model::{Aes, Geom, Kind, PlotType};
   use std::cell::Cell;
   use std::io::Read;
   use std::net::Shutdown;
@@ -318,6 +332,15 @@ mod tests {
   /// Names of all series, in order.
   fn series_names(state: &Mutex<PlotState>) -> Vec<String> {
     lock(state).series.iter().map(|s| s.name.clone()).collect()
+  }
+
+  /// The z values of series `name`; `None` if it has no z.
+  fn zs_of(state: &Mutex<PlotState>, name: &str) -> Option<Vec<f64>> {
+    let st = lock(state);
+    st.series
+      .iter()
+      .find(|s| s.name == name)
+      .and_then(|s| s.z.as_ref().map(|z| z.iter().copied().collect()))
   }
 
   #[test]
@@ -409,11 +432,13 @@ mod tests {
         Msg::Point {
           x: None,
           y: 2.5,
+          z: None,
           g: None,
         },
         Msg::Point {
           x: None,
           y: 3.5,
+          z: None,
           g: None,
         },
       ]),
@@ -434,6 +459,7 @@ mod tests {
       session(&[Msg::Point {
         x: Some(5.0),
         y: 1.0,
+        z: None,
         g: Some("k".into()),
       }]),
     );
@@ -684,5 +710,124 @@ mod tests {
     assert_eq!(registry::read_entry(name), Some(entry));
     remove_entry_if(name, "mine");
     assert_eq!(registry::read_entry(name), None);
+  }
+
+  #[test]
+  fn set_type_changes_the_plot_and_repaints() {
+    let state = Mutex::new(PlotState::new());
+    let (out, repaints) = drive(
+      &state,
+      session(&[
+        Msg::SetType {
+          plot_type: PlotType::Lines,
+          group: None,
+        },
+        Msg::SetType {
+          plot_type: PlotType::Point,
+          group: Some("k".into()),
+        },
+      ]),
+    );
+    assert_eq!(out, "complot ok plot1\n");
+    assert_eq!(repaints, 2);
+    let st = lock(&state);
+    assert_eq!(st.kind, Kind::Xy);
+    assert_eq!(st.default_geom, Geom::Lines);
+    assert_eq!(st.geom_of("k"), Geom::Points);
+  }
+
+  #[test]
+  fn set_type_to_3d_on_2d_data_is_an_error() {
+    let state = Mutex::new(PlotState::new());
+    let (out, repaints) = drive(
+      &state,
+      session(&[
+        rows(&["t,a", "0,1"]),
+        Msg::SetType {
+          plot_type: PlotType::Points3d,
+          group: None,
+        },
+      ]),
+    );
+    assert_eq!(
+      out,
+      "complot ok plot1\n\
+       error: 3D needs z values, but series 'a' have none (map z in --aes or push points with -z)\n"
+    );
+    // Only the rows changed the plot.
+    assert_eq!(repaints, 1);
+    assert_eq!(lock(&state).kind, Kind::Xy);
+  }
+
+  #[test]
+  fn point_with_z_goes_to_a_3d_plot() {
+    let state = Mutex::new(PlotState::new());
+    let (out, _) = drive(
+      &state,
+      session(&[
+        Msg::SetType {
+          plot_type: PlotType::Points3d,
+          group: None,
+        },
+        Msg::Point {
+          x: Some(1.0),
+          y: 2.0,
+          z: Some(3.0),
+          g: None,
+        },
+      ]),
+    );
+    assert_eq!(out, "complot ok plot1\n");
+    assert_eq!(points(&state, "y"), Some(vec![(1.0, 2.0)]));
+    assert_eq!(zs_of(&state, "y"), Some(vec![3.0]));
+    assert_eq!(lock(&state).z_label, "z");
+  }
+
+  #[test]
+  fn point_without_z_on_a_3d_plot_is_an_error() {
+    let state = Mutex::new(PlotState::new());
+    let (out, repaints) = drive(
+      &state,
+      session(&[
+        Msg::SetType {
+          plot_type: PlotType::Points3d,
+          group: None,
+        },
+        Msg::Point {
+          x: None,
+          y: 2.0,
+          z: None,
+          g: None,
+        },
+      ]),
+    );
+    assert_eq!(
+      out,
+      "complot ok plot1\nerror: this plot is 3D: points need a z value\n"
+    );
+    assert_eq!(repaints, 2);
+    assert_eq!(points(&state, "y"), None);
+  }
+
+  #[test]
+  fn point_with_z_for_a_series_without_z_is_an_error() {
+    let state = Mutex::new(PlotState::new());
+    let (out, _) = drive(
+      &state,
+      session(&[
+        rows(&["t,a", "0,1"]),
+        Msg::Point {
+          x: Some(1.0),
+          y: 2.0,
+          z: Some(3.0),
+          g: Some("a".into()),
+        },
+      ]),
+    );
+    assert_eq!(
+      out,
+      "complot ok plot1\nerror: series 'a' has no z values; this point has one\n"
+    );
+    assert_eq!(points(&state, "a"), Some(vec![(0.0, 1.0)]));
   }
 }

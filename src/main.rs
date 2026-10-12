@@ -5,13 +5,18 @@
 
 mod client;
 mod gui;
+mod hist;
 mod lod;
 mod model;
 mod protocol;
 mod registry;
 mod server;
+#[cfg(test)]
+mod snapshot;
+mod view3d;
 
 use clap::Parser;
+use model::PlotType;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -42,9 +47,17 @@ pub struct Cli {
   #[arg(short = 'y')]
   pub y: Option<f64>,
 
-  /// Group (series) of a single point.
-  #[arg(short = 'g', long = "group", requires = "y")]
+  /// z value of a single point, for 3D plots.
+  #[arg(short = 'z', requires = "y")]
+  pub z: Option<f64>,
+
+  /// Group (series) of a single point, or the group `-t` applies to.
+  #[arg(short = 'g', long = "group")]
   pub g: Option<String>,
+
+  /// Plot type (see --list-types); with -g, of that group only.
+  #[arg(short = 't', long = "type", value_enum, value_name = "TYPE")]
+  pub plot_type: Option<PlotType>,
 
   /// Create the plot if it is not open (otherwise pushing to it is an error).
   #[arg(short = 'c', long)]
@@ -69,6 +82,10 @@ pub struct Cli {
   /// Close all open plots.
   #[arg(long, exclusive = true)]
   pub close_all: bool,
+
+  /// List the plot types accepted by -t.
+  #[arg(long, exclusive = true, alias = "list_types")]
+  pub list_types: bool,
 
   /// Internal: run the plot server for NAME.
   #[arg(long, hide = true, exclusive = true, value_name = "NAME")]

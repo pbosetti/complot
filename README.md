@@ -15,9 +15,10 @@ complot $h --close
 ## Usage
 
 ```
-complot [NAME] [FILES...] [--aes SPEC] [-x X] [-y Y] [-g GROUP]
-        [--create] [--clear] [--close] [--title TEXT]
+complot [NAME] [FILES...] [--aes SPEC] [-x X] [-y Y] [-z Z] [-g GROUP]
+        [-t TYPE] [--create] [--clear] [--close] [--title TEXT]
 complot --list
+complot --list-types
 complot --close-all
 ```
 
@@ -25,12 +26,14 @@ complot --close-all
 |---|---|
 | `complot` | Opens a new plot with an automatic name (`plot1`, …) and prints it. |
 | `complot NAME` | Opens plot `NAME` (or reconfigures it if already open) and prints `NAME`. |
-| `complot NAME -y V [-x V] [-g G]` | Pushes one point. Without `-x`, x is the series' sample index. |
+| `complot NAME -y V [-x V] [-z V] [-g G]` | Pushes one point. Without `-x`, x is the series' sample index. |
+| `-t TYPE` / `--type` | Sets the plot type of the whole plot, or with `-g G` of group G only (see below). |
 | `complot NAME FILE...` | Pushes CSV files; `-` streams stdin line by line. |
 | `--aes "x=c1 y=c2 g=c3"` | Sets the aesthetic mapping; it is kept by the plot for later chunks. |
 | `--create` / `-c` | Opens the plot if needed when pushing data. |
 | `--clear`, `--close`, `--title T` | Clears the data, closes the window, sets the title. |
 | `--list` / `-l` | Lists the open plots. |
+| `--list-types` | Lists the plot types. |
 | `--close-all` | Closes every open plot. |
 
 Pushing data to a plot that is not open is an error (exit status 1), so a
@@ -50,10 +53,44 @@ while sleep 0.2; do complot $h -y $RANDOM || break; done
   column.
 - `g` (also `group`, `color`): grouping column; each distinct value is a series
   with its own colour.
+- `z`: depth, for 3D plots.
 
 Columns are referenced by header name, or by 1-based index when no header name
 matches (`x=1 y=3`). Without an aesthetic, column 1 is x and every other column
 is a y series.
+
+## Plot types
+
+| Type | Draws |
+|---|---|
+| `point` | points only |
+| `lines` | lines only |
+| `both` | lines and points (the default) |
+| `hist` | a histogram of y, one colour per group |
+| `3dl` | 3D lines (needs x, y and z) |
+| `3dp` | 3D points and point clouds (needs x, y and z) |
+
+`-t` restyles data already in the plot as well as what comes next: the data is
+stored once and the type only changes how it is drawn, so switching back and
+forth loses nothing. Without `-g` it applies to every series; with `-g G` only
+to group G, even before G's first point arrives. The side panel changes the same
+settings, and the last change wins.
+
+`hist` always applies to the whole plot, since a histogram's axes (value and
+count) can't be shared with x–y series. All groups share the same bins, by
+Sturges' rule unless the panel switches to Scott's; the panel also chooses
+between side-by-side and stacked bars. With a buffer limit, the histogram
+covers a rolling window of the latest values.
+
+A plot can only switch to `3dl` or `3dp` when every series has z values, and a
+3D plot refuses points without z. In 2D and 3D alike, lines and points are
+chosen per group:
+
+```sh
+h=$(complot -t 3dl --aes "x=x y=y z=z g=body")
+complot $h orbit.csv
+complot $h -g dust -t 3dp            # this group as a point cloud
+```
 
 ## CSV chunks
 
@@ -66,18 +103,26 @@ reuses the last header the plot has seen. Missing values (`""`, `NA`, `NaN`,
 ## The window
 
 Drag or scroll to pan, Ctrl/⌘+scroll or pinch to zoom, right-drag to
-box-zoom, double-click to fit. The side panel holds the few graphical settings:
-geometry (points, lines, both), point size, line width, legend, grid, follow
-(auto-fit while data arrives), a per-series buffer limit for rolling windows,
-clearing the data and copying it as CSV.
+box-zoom, double-click to fit. The side panel (collapsible with ⏴) holds the
+few graphical settings:
+
+- **Kind**: x–y, histogram or 3D (3D is greyed out until every series has z).
+- **All series** and **Series**: the geometry of every series at once, or of
+  each one (points, lines, both), plus point size and line width.
+- **Histogram**: Sturges or Scott bins, side-by-side or stacked bars.
+- **3D**: perspective on or off, reset view. Drag rotates, scroll zooms,
+  double-click resets; a click on a legend entry hides its series.
+- Legend, grid, follow (auto-fit while data arrives), a per-series buffer
+  limit for rolling windows, clearing the data and copying it as CSV.
 
 Large series (over 5,000 points) are decimated for drawing only; the stored
 data stays complete. Lines keep the first, last, minimum and maximum point of
 every pixel column, so peaks are never lost; markers keep one point per
 marker-sized screen cell. A million points draw in about 130 MB. A large
 series whose x values are not increasing is drawn as points even in line mode,
-since its line cannot be decimated. The status line says when decimation is
-active (`drawing N of M`).
+since its line cannot be decimated. 3D series are thinned the same way after
+projection, so a million-point cloud draws in about 140 MB too. The status line
+says when decimation is active (`drawing N of M`).
 
 ## Build
 

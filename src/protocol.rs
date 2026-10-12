@@ -7,7 +7,7 @@
 //!
 //! Encoding is confined to [`send`] and [`recv`] so it can be swapped.
 
-use crate::model::Aes;
+use crate::model::{Aes, PlotType};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 
@@ -23,7 +23,13 @@ pub enum Msg {
   Point {
     x: Option<f64>,
     y: f64,
+    z: Option<f64>,
     g: Option<String>,
+  },
+  /// Sets the plot type of the whole plot, or of group `group` only.
+  SetType {
+    plot_type: PlotType,
+    group: Option<String>,
   },
   /// Raw CSV lines, ingested in order as part of this connection's chunk.
   Rows { lines: Vec<String> },
@@ -80,12 +86,18 @@ mod tests {
           x: Some("t".into()),
           y: vec!["a".into(), "b".into()],
           g: None,
+          z: None,
         },
       },
       Msg::Point {
         x: None,
         y: -1.5,
+        z: Some(2.0),
         g: Some("live".into()),
+      },
+      Msg::SetType {
+        plot_type: PlotType::Lines3d,
+        group: Some("a".into()),
       },
       Msg::Rows {
         lines: vec!["1,2".into(), "3,4".into()],

@@ -1,9 +1,10 @@
 //! Client side: connecting to plot servers, spawning them, pushing data.
 
 use crate::Cli;
-use crate::model::Aes;
+use crate::model::{Aes, PlotType};
 use crate::protocol::{self, ERROR, GREETING, Msg};
 use crate::registry;
+use clap::ValueEnum;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -297,6 +298,18 @@ fn push_file(name: &str, path: &Path) -> Result<bool, String> {
   session.finish()
 }
 
+/// The `--list-types` text: one line per plot type, with its name and help.
+fn types_text() -> String {
+  PlotType::value_variants()
+    .iter()
+    .filter_map(|t| t.to_possible_value())
+    .map(|v| {
+      let help = v.get_help().map(ToString::to_string).unwrap_or_default();
+      format!("{:<6}  {help}\n", v.get_name())
+    })
+    .collect()
+}
+
 /// Runs a client invocation; never called with `--serve`.
 pub fn run(cli: &Cli) -> ExitCode {
   match execute(cli) {
@@ -323,6 +336,11 @@ fn execute(cli: &Cli) -> Result<bool, String> {
   if cli.close_all {
     return close_plots(&registry::names());
   }
+  if cli.list_types {
+    // Ignore write errors so that `complot --list-types | head -1` works.
+    let _ = write!(io::stdout(), "{}", types_text());
+    return Ok(false);
+  }
 
   let has_data = !cli.files.is_empty() || cli.y.is_some();
   let name = match &cli.name {
@@ -335,8 +353,15 @@ fn execute(cli: &Cli) -> Result<bool, String> {
     return Err(format!("invalid plot name '{name}'"));
   }
   // Non-finite numbers have no JSON encoding.
-  if cli.x.is_some_and(|x| !x.is_finite()) || cli.y.is_some_and(|y| !y.is_finite()) {
-    return Err("-x and -y must be finite numbers".into());
+  if [cli.x, cli.y, cli.z]
+    .iter()
+    .flatten()
+    .any(|v| !v.is_finite())
+  {
+    return Err("-x, -y and -z must be finite numbers".into());
+  }
+  if cli.g.is_some() && cli.y.is_none() && cli.plot_type.is_none() {
+    return Err("-g needs -y (a point) or -t (the group's type)".into());
   }
   let aes = cli
     .aes
@@ -371,10 +396,18 @@ fn execute(cli: &Cli) -> Result<bool, String> {
   if cli.clear {
     session.send(&Msg::Clear)?;
   }
+  // Before the point, so that a new 3D plot accepts it.
+  if let Some(plot_type) = cli.plot_type {
+    session.send(&Msg::SetType {
+      plot_type,
+      group: cli.g.clone(),
+    })?;
+  }
   if let Some(y) = cli.y {
     session.send(&Msg::Point {
       x: cli.x,
       y,
+      z: cli.z,
       g: cli.g.clone(),
     })?;
   }
@@ -625,6 +658,71 @@ mod tests {
     fs::remove_file(&path).unwrap();
     assert_eq!(failed, Ok(true));
     server.join().unwrap();
+    registry::remove_entry(name);
+  }
+
+  #[test]
+  fn list_types_names_every_type_with_its_help() {
+    let text = types_text();
+    assert_eq!(text.lines().count(), 6, "{text}");
+    for line in [
+      "point   Points only",
+      "lines   Lines only",
+      "both    Lines and points",
+      "hist    Histogram of y by group (whole plot)",
+      "3dl     3D lines (needs x, y and z)",
+      "3dp     3D points and point clouds (needs x, y and z)",
+    ] {
+      assert!(
+        text.lines().any(|l| l == line),
+        "no line {line:?} in {text:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn point_options_are_checked_before_connecting() {
+    use clap::Parser;
+    let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap();
+    assert_eq!(
+      execute(&parse(&["complot", "p", "-g", "a"])),
+      Err("-g needs -y (a point) or -t (the group's type)".to_string())
+    );
+    assert_eq!(
+      execute(&parse(&["complot", "p", "-y", "1", "-z", "inf"])),
+      Err("-x, -y and -z must be finite numbers".to_string())
+    );
+  }
+
+  #[test]
+  fn type_is_sent_before_the_point() {
+    use clap::Parser;
+    registry::init_test_dir();
+    let name = "cl_type";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token = register(name, &listener);
+    let server = fake_server(listener, name, &token, "");
+
+    let cli = Cli::try_parse_from([
+      "complot", name, "-t", "3dp", "-g", "k", "-y", "1", "-z", "2",
+    ])
+    .unwrap();
+    assert_eq!(execute(&cli), Ok(false));
+    assert_eq!(
+      server.join().unwrap(),
+      vec![
+        Msg::SetType {
+          plot_type: PlotType::Points3d,
+          group: Some("k".into()),
+        },
+        Msg::Point {
+          x: None,
+          y: 1.0,
+          z: Some(2.0),
+          g: Some("k".into()),
+        },
+      ]
+    );
     registry::remove_entry(name);
   }
 }

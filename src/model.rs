@@ -17,6 +17,8 @@ pub struct Aes {
   /// One or more y columns; with several, each becomes its own series.
   pub y: Vec<String>,
   pub g: Option<String>,
+  /// Depth, for 3D plots.
+  pub z: Option<String>,
 }
 
 impl Aes {
@@ -32,7 +34,8 @@ impl Aes {
         "x" => "x",
         "y" => "y",
         "g" | "group" | "color" | "colour" => "g",
-        _ => return Err(format!("unknown aesthetic '{key}' (expected x, y or g)")),
+        "z" => "z",
+        _ => return Err(format!("unknown aesthetic '{key}' (expected x, y, g or z)")),
       };
       if seen.contains(&name) {
         return Err(format!("duplicate aesthetic '{name}'"));
@@ -41,10 +44,67 @@ impl Aes {
       match name {
         "x" => aes.x = Some(single_column(name, value)?),
         "g" => aes.g = Some(single_column(name, value)?),
+        "z" => aes.z = Some(single_column(name, value)?),
         _ => aes.y = y_columns(value)?,
       }
     }
     Ok(aes)
+  }
+}
+
+/// How the points of a series are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Geom {
+  Points,
+  Lines,
+  #[default]
+  Both,
+}
+
+/// What a plot shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Kind {
+  /// Series on x–y axes.
+  #[default]
+  Xy,
+  /// A histogram of the y values, by series.
+  Hist,
+  /// Series in 3D (x, y, z).
+  ThreeD,
+}
+
+/// A plot type, as given to `-t`. The doc comments are the `--list-types` help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+pub enum PlotType {
+  /// Points only
+  #[value(name = "point", alias = "points")]
+  Point,
+  /// Lines only
+  #[value(name = "lines", alias = "line")]
+  Lines,
+  /// Lines and points
+  Both,
+  /// Histogram of y by group (whole plot)
+  Hist,
+  /// 3D lines (needs x, y and z)
+  #[value(name = "3dl")]
+  Lines3d,
+  /// 3D points and point clouds (needs x, y and z)
+  #[value(name = "3dp")]
+  Points3d,
+}
+
+impl PlotType {
+  /// The plot kind of this type and, except for a histogram, its geometry.
+  pub fn kind_geom(self) -> (Kind, Option<Geom>) {
+    match self {
+      PlotType::Point => (Kind::Xy, Some(Geom::Points)),
+      PlotType::Lines => (Kind::Xy, Some(Geom::Lines)),
+      PlotType::Both => (Kind::Xy, Some(Geom::Both)),
+      PlotType::Hist => (Kind::Hist, None),
+      PlotType::Lines3d => (Kind::ThreeD, Some(Geom::Lines)),
+      PlotType::Points3d => (Kind::ThreeD, Some(Geom::Points)),
+    }
   }
 }
 
@@ -53,6 +113,9 @@ impl Aes {
 pub struct Series {
   pub name: String,
   pub points: VecDeque<PlotPoint>,
+  /// z values, one per point, for a 3D series; `None` for a 2D one. Whether a
+  /// series has z is decided by its first point.
+  pub z: Option<VecDeque<f64>>,
   /// Next implicit x for points pushed without an x value.
   pub next_index: f64,
   /// True while x never decreases, so that the points are sorted by x.
@@ -76,10 +139,19 @@ pub struct PlotState {
   /// Axis labels; empty means none.
   pub x_label: String,
   pub y_label: String,
+  pub z_label: String,
   /// Window title requested by a client, if any.
   pub title: Option<String>,
   /// Set by a `Close` message; the GUI closes the window when it sees it.
   pub close_requested: bool,
+  /// What the plot shows.
+  pub kind: Kind,
+  /// Geometry of the series that have none of their own in `geoms`.
+  pub default_geom: Geom,
+  /// Geometry by group, set with `-g G -t TYPE`; may name groups not seen yet.
+  pub geoms: HashMap<String, Geom>,
+  /// Incremented on every change to the data, so derived views can be cached.
+  pub version: u64,
   /// Series name to position in `series`.
   index: HashMap<String, usize>,
 }
@@ -98,10 +170,22 @@ impl PlotState {
 
   /// Appends a point to a named series, creating the series on first use.
   /// A missing `x` is the series' implicit index. Non-finite values are skipped.
-  pub fn push_point(&mut self, series: &str, x: Option<f64>, y: f64) {
-    if !y.is_finite() || x.is_some_and(|x| !x.is_finite()) {
+  /// A point whose z does not fit its series or the plot is refused with an
+  /// error. Both kinds count in `skipped`.
+  pub fn push_point(
+    &mut self,
+    series: &str,
+    x: Option<f64>,
+    y: f64,
+    z: Option<f64>,
+  ) -> Result<(), String> {
+    if !finite_point(x, y, z) {
       self.skipped += 1;
-      return;
+      return Ok(());
+    }
+    if let Some(reason) = self.reject_reason(series, z.is_some()) {
+      self.skipped += 1;
+      return Err(reason);
     }
     let pos = self.series_pos(series);
     let s = &mut self.series[pos];
@@ -111,22 +195,29 @@ impl PlotState {
     }
     s.next_index += 1.0;
     s.points.push_back(PlotPoint::new(x, y));
-    drop_oldest(&mut s.points, self.max_points);
+    if let Some(z) = z {
+      s.z.get_or_insert_with(VecDeque::new).push_back(z);
+    }
+    drop_oldest(s, self.max_points);
+    self.version += 1;
+    Ok(())
   }
 
-  /// Removes all series; settings, header and labels are kept.
+  /// Removes all series; settings, type, header and labels are kept.
   pub fn clear(&mut self) {
     self.series.clear();
     self.index.clear();
     self.skipped = 0;
+    self.version += 1;
   }
 
   /// Sets the per-series buffer limit (0 = unlimited) and trims existing series.
   pub fn set_max_points(&mut self, n: usize) {
     self.max_points = n;
     for s in &mut self.series {
-      drop_oldest(&mut s.points, n);
+      drop_oldest(s, n);
     }
+    self.version += 1;
   }
 
   /// Number of points stored across all series.
@@ -134,16 +225,97 @@ impl PlotState {
     self.series.iter().map(|s| s.points.len()).sum()
   }
 
-  /// Renders all points as CSV with a `series,x,y` header line.
+  /// Applies a `-t` type to the whole plot, or to one group only. Refused
+  /// with an error, and nothing changed, if the type does not fit the data.
+  pub fn set_type(&mut self, plot_type: PlotType, group: Option<&str>) -> Result<(), String> {
+    let (kind, geom) = plot_type.kind_geom();
+    if kind == Kind::Hist && group.is_some() {
+      return Err("a histogram applies to the whole plot; drop -g".to_string());
+    }
+    if kind == Kind::ThreeD && !self.all_have_z() {
+      let names: Vec<String> = self
+        .series
+        .iter()
+        .filter(|s| s.z.is_none())
+        .take(5)
+        .map(|s| format!("'{}'", s.name))
+        .collect();
+      return Err(format!(
+        "3D needs z values, but series {} have none (map z in --aes or push points with -z)",
+        names.join(", ")
+      ));
+    }
+    self.kind = kind;
+    match (geom, group) {
+      (Some(geom), None) => {
+        self.default_geom = geom;
+        self.geoms.clear();
+      }
+      (Some(geom), Some(group)) => {
+        self.geoms.insert(group.to_string(), geom);
+      }
+      (None, _) => {}
+    }
+    self.version += 1;
+    Ok(())
+  }
+
+  /// Geometry series `name` is drawn with: its own, else its group's
+  /// (the part before the first `/` of a `group/column` name), else the default.
+  pub fn geom_of(&self, name: &str) -> Geom {
+    if let Some(&geom) = self.geoms.get(name) {
+      return geom;
+    }
+    if let Some((group, _)) = name.split_once('/')
+      && let Some(&geom) = self.geoms.get(group)
+    {
+      return geom;
+    }
+    self.default_geom
+  }
+
+  /// True if every series has z values (vacuously true with no series).
+  pub fn all_have_z(&self) -> bool {
+    self.series.iter().all(|s| s.z.is_some())
+  }
+
+  /// Renders all points as CSV. The header is `series,x,y`, with a `z` column
+  /// after them if any series has z; a series without z gets an empty field.
   pub fn to_csv(&self) -> String {
-    let mut out = String::from("series,x,y\n");
+    let has_z = self.series.iter().any(|s| s.z.is_some());
+    let mut out = if has_z {
+      String::from("series,x,y,z\n")
+    } else {
+      String::from("series,x,y\n")
+    };
     for s in &self.series {
       let name = csv_quote(&s.name);
-      for p in &s.points {
-        let _ = writeln!(out, "{name},{},{}", p.x, p.y);
+      for (i, p) in s.points.iter().enumerate() {
+        let _ = write!(out, "{name},{},{}", p.x, p.y);
+        if has_z {
+          let z = s.z.as_ref().and_then(|z| z.get(i));
+          let _ = write!(out, ",{}", z.map(f64::to_string).unwrap_or_default());
+        }
+        out.push('\n');
       }
     }
     out
+  }
+
+  /// Why a point of series `name` would be refused, if it would: a 3D plot
+  /// needs z, and a series keeps its z-ness (decided by its first point).
+  fn reject_reason(&self, name: &str, has_z: bool) -> Option<String> {
+    if self.kind == Kind::ThreeD && !has_z {
+      return Some("this plot is 3D: points need a z value".to_string());
+    }
+    let s = &self.series[*self.index.get(name)?];
+    match (s.z.is_some(), has_z) {
+      (true, false) => Some(format!("series '{name}' has z values; this point has none")),
+      (false, true) => Some(format!(
+        "series '{name}' has no z values; this point has one"
+      )),
+      _ => None,
+    }
   }
 
   /// Position of the series called `name`, appending an empty series if it is new.
@@ -180,9 +352,12 @@ struct Resolved {
   /// Columns of y, in the order of `Aes::y`.
   ys: Vec<usize>,
   g: Option<usize>,
-  /// Names of the x and y columns, for labels and messages.
+  /// Column of z, `None` unless the mapping has one.
+  z: Option<usize>,
+  /// Names of the x, y and z columns, for labels and messages.
   x_name: Option<String>,
   y_names: Vec<String>,
+  z_name: Option<String>,
   /// Number of fields a row needs to cover every resolved column.
   needed: usize,
 }
@@ -234,6 +409,7 @@ impl Chunk {
             } else {
               String::new()
             };
+            state.z_label = r.z_name.clone().unwrap_or_default();
             r
           }
           Err(e) => {
@@ -258,11 +434,20 @@ fn csv_quote(field: &str) -> String {
   }
 }
 
-/// Drops the oldest points so that at most `max` remain; 0 means unlimited.
-fn drop_oldest(points: &mut VecDeque<PlotPoint>, max: usize) {
+/// True if every value of a point is finite; other points are skipped.
+fn finite_point(x: Option<f64>, y: f64, z: Option<f64>) -> bool {
+  y.is_finite() && x.is_none_or(f64::is_finite) && z.is_none_or(f64::is_finite)
+}
+
+/// Drops the oldest points of `s` so that at most `max` remain, with their z
+/// values; 0 means unlimited.
+fn drop_oldest(s: &mut Series, max: usize) {
   if max > 0 {
-    let excess = points.len().saturating_sub(max);
-    points.drain(..excess);
+    let excess = s.points.len().saturating_sub(max);
+    s.points.drain(..excess);
+    if let Some(z) = &mut s.z {
+      z.drain(..excess);
+    }
   }
 }
 
@@ -364,8 +549,13 @@ fn resolve(aes: &Aes, names: &[String], n: usize, rev: u64) -> Result<Resolved, 
     .as_deref()
     .map(|r| column_index(names, n, r))
     .transpose()?;
+  let z = aes
+    .z
+    .as_deref()
+    .map(|r| column_index(names, n, r))
+    .transpose()?;
   let (x, ys) = if aes.y.is_empty() {
-    let avail: Vec<usize> = (0..n).filter(|i| Some(*i) != g).collect();
+    let avail: Vec<usize> = (0..n).filter(|i| Some(*i) != g && Some(*i) != z).collect();
     let x = match aes.x.as_deref() {
       Some(r) => Some(column_index(names, n, r)?),
       None if avail.len() >= 2 => Some(avail[0]),
@@ -389,15 +579,23 @@ fn resolve(aes: &Aes, names: &[String], n: usize, rev: u64) -> Result<Resolved, 
       .collect::<Result<Vec<usize>, String>>()?;
     (x, ys)
   };
-  let needed = g.iter().chain(&x).chain(&ys).max().map_or(0, |&m| m + 1);
+  let needed = g
+    .iter()
+    .chain(&x)
+    .chain(&ys)
+    .chain(&z)
+    .max()
+    .map_or(0, |&m| m + 1);
   let name_of = |i: usize| names.get(i).cloned().unwrap_or_else(|| (i + 1).to_string());
   Ok(Resolved {
     rev,
     x_name: x.map(name_of),
     y_names: ys.iter().map(|&i| name_of(i)).collect(),
+    z_name: z.map(name_of),
     x,
     ys,
     g,
+    z,
     needed,
   })
 }
@@ -437,6 +635,25 @@ fn map_row(
     }
   };
 
+  let z = match r.z {
+    None => None,
+    Some(i) => {
+      let v = fields[i].as_str();
+      if is_missing(v) {
+        state.skipped += 1;
+        return Ok(());
+      }
+      match v.parse::<f64>() {
+        Ok(z) => Some(z),
+        Err(_) => {
+          state.skipped += 1;
+          let col = r.z_name.as_deref().unwrap_or_default();
+          return Err(format!("cannot parse z value '{v}' in column '{col}'"));
+        }
+      }
+    }
+  };
+
   // Parse every y first, so that one bad value rejects the whole row.
   let mut values = Vec::with_capacity(r.ys.len());
   for (k, &i) in r.ys.iter().enumerate() {
@@ -455,14 +672,29 @@ fn map_row(
   }
 
   let g = r.g.map(|i| fields[i].as_str());
-  for (k, y) in values {
-    let ycol = &r.y_names[k];
-    let name = match g {
-      Some(g) if r.ys.len() > 1 => format!("{g}/{ycol}"),
-      Some(g) => g.to_string(),
-      None => ycol.clone(),
-    };
-    state.push_point(&name, x, y);
+  let points: Vec<(String, f64)> = values
+    .into_iter()
+    .map(|(k, y)| {
+      let ycol = &r.y_names[k];
+      let name = match g {
+        Some(g) if r.ys.len() > 1 => format!("{g}/{ycol}"),
+        Some(g) => g.to_string(),
+        None => ycol.clone(),
+      };
+      (name, y)
+    })
+    .collect();
+  // Check every series first, so that one refused point rejects the whole row.
+  for (name, y) in &points {
+    if finite_point(x, *y, z)
+      && let Some(reason) = state.reject_reason(name, z.is_some())
+    {
+      state.skipped += 1;
+      return Err(reason);
+    }
+  }
+  for (name, y) in &points {
+    state.push_point(name, x, *y, z)?;
   }
   Ok(())
 }
@@ -487,6 +719,18 @@ mod tests {
       .find(|s| s.name == name)
       .unwrap_or_else(|| panic!("no series '{name}'"));
     series.points.iter().map(|p| (p.x, p.y)).collect()
+  }
+
+  /// The z values of the series called `name`; `None` if it has no z.
+  fn zs(state: &PlotState, name: &str) -> Option<Vec<f64>> {
+    state
+      .series
+      .iter()
+      .find(|s| s.name == name)
+      .unwrap_or_else(|| panic!("no series '{name}'"))
+      .z
+      .as_ref()
+      .map(|z| z.iter().copied().collect())
   }
 
   /// Names of all series, in order.
@@ -529,11 +773,24 @@ mod tests {
   }
 
   #[test]
+  fn aes_parse_z() {
+    assert_eq!(aes("z=c").z.as_deref(), Some("c"));
+    assert_eq!(aes("Z=c"), aes("z=c"));
+    assert_eq!(aes("x=t y=a z=c").z.as_deref(), Some("c"));
+    assert!(Aes::parse("z=").is_err());
+    assert!(Aes::parse("z=a,b").is_err());
+    assert_eq!(
+      Aes::parse("z=a z=b").unwrap_err(),
+      "duplicate aesthetic 'z'"
+    );
+  }
+
+  #[test]
   fn aes_parse_errors() {
     assert!(Aes::parse("x").is_err());
     assert_eq!(
       Aes::parse("foo=1").unwrap_err(),
-      "unknown aesthetic 'foo' (expected x, y or g)"
+      "unknown aesthetic 'foo' (expected x, y, g or z)"
     );
     assert_eq!(
       Aes::parse("x=a x=b").unwrap_err(),
@@ -815,11 +1072,11 @@ mod tests {
   #[test]
   fn push_point_uses_implicit_index_per_series() {
     let mut state = PlotState::new();
-    state.push_point("a", None, 1.0);
-    state.push_point("a", None, 2.0);
-    state.push_point("b", None, 5.0);
-    state.push_point("a", Some(10.0), 3.0);
-    state.push_point("a", None, 4.0);
+    state.push_point("a", None, 1.0, None).unwrap();
+    state.push_point("a", None, 2.0, None).unwrap();
+    state.push_point("b", None, 5.0, None).unwrap();
+    state.push_point("a", Some(10.0), 3.0, None).unwrap();
+    state.push_point("a", None, 4.0, None).unwrap();
     assert_eq!(names(&state), ["a", "b"]);
     assert_eq!(
       points(&state, "a"),
@@ -831,11 +1088,11 @@ mod tests {
   #[test]
   fn push_point_skips_non_finite_without_advancing_index() {
     let mut state = PlotState::new();
-    state.push_point("a", Some(f64::NAN), 1.0);
-    state.push_point("a", None, f64::INFINITY);
+    state.push_point("a", Some(f64::NAN), 1.0, None).unwrap();
+    state.push_point("a", None, f64::INFINITY, None).unwrap();
     assert_eq!(state.skipped, 2);
     assert_eq!(state.total_points(), 0);
-    state.push_point("a", None, 1.0);
+    state.push_point("a", None, 1.0, None).unwrap();
     assert_eq!(points(&state, "a"), [(0.0, 1.0)]);
   }
 
@@ -844,15 +1101,15 @@ mod tests {
     let mut state = PlotState::new();
     state.set_max_points(3);
     for i in 0..5 {
-      state.push_point("a", None, f64::from(i));
+      state.push_point("a", None, f64::from(i), None).unwrap();
     }
     assert_eq!(points(&state, "a"), [(2.0, 2.0), (3.0, 3.0), (4.0, 4.0)]);
     assert_eq!(state.total_points(), 3);
     state.set_max_points(1);
     assert_eq!(points(&state, "a"), [(4.0, 4.0)]);
     state.set_max_points(0);
-    state.push_point("a", None, 5.0);
-    state.push_point("a", None, 6.0);
+    state.push_point("a", None, 5.0, None).unwrap();
+    state.push_point("a", None, 6.0, None).unwrap();
     assert_eq!(state.total_points(), 3);
   }
 
@@ -875,7 +1132,7 @@ mod tests {
     assert_eq!(state.header, Some(vec!["t".to_string(), "a".to_string()]));
     assert_eq!(state.x_label, "t");
     // The name index was cleared too, so the series is created afresh.
-    state.push_point("a", None, 9.0);
+    state.push_point("a", None, 9.0, None).unwrap();
     assert_eq!(names(&state), ["a"]);
     assert_eq!(points(&state, "a"), [(0.0, 9.0)]);
   }
@@ -884,10 +1141,10 @@ mod tests {
   fn to_csv_lists_points_and_quotes_names() {
     let mut state = PlotState::new();
     assert_eq!(state.to_csv(), "series,x,y\n");
-    state.push_point("a", Some(0.0), 1.5);
-    state.push_point("b,c", Some(1.0), 2.0);
-    state.push_point("a", Some(2.0), -3.0);
-    state.push_point("q\"t", None, 4.0);
+    state.push_point("a", Some(0.0), 1.5, None).unwrap();
+    state.push_point("b,c", Some(1.0), 2.0, None).unwrap();
+    state.push_point("a", Some(2.0), -3.0, None).unwrap();
+    state.push_point("q\"t", None, 4.0, None).unwrap();
     assert_eq!(
       state.to_csv(),
       "series,x,y\na,0,1.5\na,2,-3\n\"b,c\",1,2\n\"q\"\"t\",0,4\n"
@@ -908,43 +1165,313 @@ mod tests {
   fn implicit_index_keeps_series_sorted() {
     let mut state = PlotState::new();
     for _ in 0..4 {
-      state.push_point("a", None, 1.0);
+      state.push_point("a", None, 1.0, None).unwrap();
     }
     assert!(is_sorted(&state, "a"));
     // Equal x values are still in order.
-    state.push_point("b", Some(2.0), 1.0);
-    state.push_point("b", Some(2.0), 2.0);
+    state.push_point("b", Some(2.0), 1.0, None).unwrap();
+    state.push_point("b", Some(2.0), 2.0, None).unwrap();
     assert!(is_sorted(&state, "b"));
   }
 
   #[test]
   fn decreasing_x_clears_sorted_for_good() {
     let mut state = PlotState::new();
-    state.push_point("a", Some(1.0), 1.0);
-    state.push_point("a", Some(3.0), 1.0);
+    state.push_point("a", Some(1.0), 1.0, None).unwrap();
+    state.push_point("a", Some(3.0), 1.0, None).unwrap();
     assert!(is_sorted(&state, "a"));
-    state.push_point("a", Some(2.0), 1.0);
+    state.push_point("a", Some(2.0), 1.0, None).unwrap();
     assert!(!is_sorted(&state, "a"));
     // Larger x values do not restore the flag.
-    state.push_point("a", Some(10.0), 1.0);
+    state.push_point("a", Some(10.0), 1.0, None).unwrap();
     assert!(!is_sorted(&state, "a"));
     // The implicit index can also decrease, after a larger explicit x.
-    state.push_point("b", Some(10.0), 1.0);
-    state.push_point("b", None, 1.0);
+    state.push_point("b", Some(10.0), 1.0, None).unwrap();
+    state.push_point("b", None, 1.0, None).unwrap();
     assert!(!is_sorted(&state, "b"));
     // Other series are unaffected.
-    state.push_point("c", Some(5.0), 1.0);
+    state.push_point("c", Some(5.0), 1.0, None).unwrap();
     assert!(is_sorted(&state, "c"));
   }
 
   #[test]
   fn clear_then_push_gives_sorted_series_again() {
     let mut state = PlotState::new();
-    state.push_point("a", Some(2.0), 1.0);
-    state.push_point("a", Some(1.0), 1.0);
+    state.push_point("a", Some(2.0), 1.0, None).unwrap();
+    state.push_point("a", Some(1.0), 1.0, None).unwrap();
     assert!(!is_sorted(&state, "a"));
     state.clear();
-    state.push_point("a", Some(0.0), 1.0);
+    state.push_point("a", Some(0.0), 1.0, None).unwrap();
     assert!(is_sorted(&state, "a"));
+  }
+
+  #[test]
+  fn csv_z_column_gives_series_z_values() {
+    let mut state = PlotState::new();
+    state.set_aes(aes("x=x y=y z=z"));
+    feed(&mut state, &["x,y,z", "0,1,2", "1,3,4"]);
+    assert_eq!(points(&state, "y"), [(0.0, 1.0), (1.0, 3.0)]);
+    assert_eq!(zs(&state, "y"), Some(vec![2.0, 4.0]));
+    assert_eq!(state.x_label, "x");
+    assert_eq!(state.z_label, "z");
+    assert_eq!(state.skipped, 0);
+  }
+
+  #[test]
+  fn z_label_is_empty_without_z() {
+    let mut state = PlotState::new();
+    feed(&mut state, &["t,a,b", "0,1,2"]);
+    assert_eq!(state.z_label, "");
+    assert_eq!(zs(&state, "a"), None);
+  }
+
+  #[test]
+  fn default_mapping_leaves_z_out_of_the_y_columns() {
+    let mut state = PlotState::new();
+    state.set_aes(aes("z=c"));
+    feed(&mut state, &["t,a,c", "0,1,2"]);
+    assert_eq!(names(&state), ["a"]);
+    assert_eq!(points(&state, "a"), [(0.0, 1.0)]);
+    assert_eq!(zs(&state, "a"), Some(vec![2.0]));
+    assert_eq!(state.x_label, "t");
+    assert_eq!(state.z_label, "c");
+  }
+
+  #[test]
+  fn missing_z_skips_row_and_bad_z_is_an_error() {
+    let mut state = PlotState::new();
+    state.set_aes(aes("x=t y=a z=c"));
+    let mut chunk = Chunk::new();
+    chunk.ingest(&mut state, "t,a,c").unwrap();
+    chunk.ingest(&mut state, "0,1,2").unwrap();
+    chunk.ingest(&mut state, "1,3,").unwrap();
+    chunk.ingest(&mut state, "2,5,NA").unwrap();
+    assert_eq!(state.skipped, 2);
+    let err = chunk.ingest(&mut state, "3,7,zz").unwrap_err();
+    assert_eq!(err, "cannot parse z value 'zz' in column 'c'");
+    assert_eq!(state.skipped, 3);
+    assert_eq!(points(&state, "a"), [(0.0, 1.0)]);
+    assert_eq!(zs(&state, "a"), Some(vec![2.0]));
+  }
+
+  #[test]
+  fn csv_rows_without_z_are_refused_by_a_3d_plot() {
+    let mut state = PlotState::new();
+    state.set_type(PlotType::Points3d, None).unwrap();
+    let mut chunk = Chunk::new();
+    chunk.ingest(&mut state, "t,a").unwrap();
+    let err = chunk.ingest(&mut state, "0,1").unwrap_err();
+    assert_eq!(err, "this plot is 3D: points need a z value");
+    assert_eq!(state.skipped, 1);
+    assert!(state.series.is_empty());
+  }
+
+  #[test]
+  fn row_with_a_refused_series_adds_no_points() {
+    let mut state = PlotState::new();
+    state.push_point("b", None, 1.0, None).unwrap();
+    state.set_aes(aes("x=t y=a,b z=c"));
+    let mut chunk = Chunk::new();
+    chunk.ingest(&mut state, "t,a,b,c").unwrap();
+    let err = chunk.ingest(&mut state, "0,1,2,3").unwrap_err();
+    assert_eq!(err, "series 'b' has no z values; this point has one");
+    assert_eq!(state.skipped, 1);
+    assert_eq!(names(&state), ["b"]);
+    assert_eq!(points(&state, "b"), [(0.0, 1.0)]);
+  }
+
+  #[test]
+  fn push_point_checks_z_against_the_series() {
+    let mut state = PlotState::new();
+    state.push_point("a", None, 1.0, None).unwrap();
+    state.push_point("b", None, 2.0, Some(5.0)).unwrap();
+    assert_eq!(zs(&state, "a"), None);
+    assert_eq!(zs(&state, "b"), Some(vec![5.0]));
+    let err = state.push_point("a", None, 3.0, Some(1.0)).unwrap_err();
+    assert_eq!(err, "series 'a' has no z values; this point has one");
+    let err = state.push_point("b", None, 3.0, None).unwrap_err();
+    assert_eq!(err, "series 'b' has z values; this point has none");
+    assert_eq!(state.skipped, 2);
+    assert_eq!(points(&state, "a"), [(0.0, 1.0)]);
+    assert_eq!(points(&state, "b"), [(0.0, 2.0)]);
+  }
+
+  #[test]
+  fn push_point_on_a_3d_plot_needs_z() {
+    let mut state = PlotState::new();
+    state.set_type(PlotType::Lines3d, None).unwrap();
+    let err = state.push_point("a", None, 1.0, None).unwrap_err();
+    assert_eq!(err, "this plot is 3D: points need a z value");
+    assert_eq!(state.skipped, 1);
+    assert!(state.series.is_empty());
+    state.push_point("a", None, 1.0, Some(2.0)).unwrap();
+    assert_eq!(zs(&state, "a"), Some(vec![2.0]));
+  }
+
+  #[test]
+  fn non_finite_z_is_skipped_like_other_values() {
+    let mut state = PlotState::new();
+    state.push_point("a", None, 1.0, Some(1.0)).unwrap();
+    assert_eq!(
+      state.push_point("a", None, 2.0, Some(f64::INFINITY)),
+      Ok(())
+    );
+    assert_eq!(state.skipped, 1);
+    assert_eq!(zs(&state, "a"), Some(vec![1.0]));
+  }
+
+  #[test]
+  fn max_points_trims_z_with_the_points() {
+    let mut state = PlotState::new();
+    state.set_max_points(2);
+    for i in 0..4 {
+      state
+        .push_point("a", None, f64::from(i), Some(f64::from(10 * i)))
+        .unwrap();
+    }
+    assert_eq!(points(&state, "a"), [(2.0, 2.0), (3.0, 3.0)]);
+    assert_eq!(zs(&state, "a"), Some(vec![20.0, 30.0]));
+    state.set_max_points(1);
+    assert_eq!(points(&state, "a"), [(3.0, 3.0)]);
+    assert_eq!(zs(&state, "a"), Some(vec![30.0]));
+  }
+
+  #[test]
+  fn version_counts_every_change_to_the_data() {
+    let mut state = PlotState::new();
+    let v0 = state.version;
+    state.push_point("a", None, 1.0, None).unwrap();
+    assert_eq!(state.version, v0 + 1);
+    // A refused point changes nothing.
+    assert!(state.push_point("a", None, 1.0, Some(1.0)).is_err());
+    assert_eq!(state.version, v0 + 1);
+    state.set_max_points(5);
+    assert_eq!(state.version, v0 + 2);
+    state.clear();
+    assert_eq!(state.version, v0 + 3);
+    state.set_type(PlotType::Lines, None).unwrap();
+    assert_eq!(state.version, v0 + 4);
+  }
+
+  #[test]
+  fn set_type_applies_to_the_whole_plot() {
+    let mut state = PlotState::new();
+    state.push_point("a", None, 1.0, None).unwrap();
+    state.set_type(PlotType::Point, None).unwrap();
+    assert_eq!(state.kind, Kind::Xy);
+    assert_eq!(state.default_geom, Geom::Points);
+    assert_eq!(state.geom_of("a"), Geom::Points);
+  }
+
+  #[test]
+  fn set_type_with_a_group_applies_to_that_group_only() {
+    let mut state = PlotState::new();
+    state.set_type(PlotType::Lines, None).unwrap();
+    state.set_type(PlotType::Point, Some("k")).unwrap();
+    assert_eq!(state.kind, Kind::Xy);
+    assert_eq!(state.geom_of("k"), Geom::Points);
+    assert_eq!(state.geom_of("other"), Geom::Lines);
+    assert_eq!(state.geoms.len(), 1);
+  }
+
+  #[test]
+  fn whole_plot_type_clears_group_types() {
+    let mut state = PlotState::new();
+    state.set_type(PlotType::Point, Some("k")).unwrap();
+    assert_eq!(state.geom_of("k"), Geom::Points);
+    state.set_type(PlotType::Lines, None).unwrap();
+    assert!(state.geoms.is_empty());
+    assert_eq!(state.geom_of("k"), Geom::Lines);
+  }
+
+  #[test]
+  fn histogram_is_whole_plot_only() {
+    let mut state = PlotState::new();
+    state.push_point("a", None, 1.0, None).unwrap();
+    assert_eq!(
+      state.set_type(PlotType::Hist, Some("a")),
+      Err("a histogram applies to the whole plot; drop -g".to_string())
+    );
+    assert_eq!(state.kind, Kind::Xy);
+    state.set_type(PlotType::Hist, None).unwrap();
+    assert_eq!(state.kind, Kind::Hist);
+  }
+
+  #[test]
+  fn three_d_is_refused_and_lists_the_series_without_z() {
+    let mut state = PlotState::new();
+    state.push_point("a", None, 1.0, None).unwrap();
+    state.push_point("b", None, 2.0, None).unwrap();
+    state.push_point("c", None, 3.0, Some(1.0)).unwrap();
+    assert_eq!(
+      state.set_type(PlotType::Lines3d, None),
+      Err(
+        "3D needs z values, but series 'a', 'b' have none (map z in --aes or push points with -z)"
+          .to_string()
+      )
+    );
+    assert_eq!(state.kind, Kind::Xy);
+  }
+
+  #[test]
+  fn three_d_error_lists_at_most_five_series() {
+    let mut state = PlotState::new();
+    for name in ["a", "b", "c", "d", "e", "f"] {
+      state.push_point(name, None, 1.0, None).unwrap();
+    }
+    assert_eq!(
+      state.set_type(PlotType::Points3d, None).unwrap_err(),
+      "3D needs z values, but series 'a', 'b', 'c', 'd', 'e' have none (map z in --aes or push points with -z)"
+    );
+  }
+
+  #[test]
+  fn three_d_is_allowed_on_an_empty_plot_and_with_z_everywhere() {
+    let mut state = PlotState::new();
+    state.set_type(PlotType::Points3d, None).unwrap();
+    assert_eq!(state.kind, Kind::ThreeD);
+    assert_eq!(state.default_geom, Geom::Points);
+
+    let mut state = PlotState::new();
+    state.push_point("a", None, 1.0, Some(2.0)).unwrap();
+    state.set_type(PlotType::Lines3d, None).unwrap();
+    assert_eq!(state.kind, Kind::ThreeD);
+    assert_eq!(state.default_geom, Geom::Lines);
+  }
+
+  #[test]
+  fn geom_of_falls_back_from_series_to_group_to_default() {
+    let mut state = PlotState::new();
+    state.set_type(PlotType::Lines, None).unwrap();
+    state.set_type(PlotType::Point, Some("k")).unwrap();
+    state.set_type(PlotType::Lines, Some("k/a")).unwrap();
+    // The series' own entry wins over its group's.
+    assert_eq!(state.geom_of("k/a"), Geom::Lines);
+    assert_eq!(state.geom_of("k/b"), Geom::Points);
+    assert_eq!(state.geom_of("k"), Geom::Points);
+    assert_eq!(state.geom_of("kk"), Geom::Lines);
+    assert_eq!(state.geom_of("j/b"), Geom::Lines);
+  }
+
+  #[test]
+  fn to_csv_adds_a_z_column_when_a_series_has_z() {
+    let mut state = PlotState::new();
+    state.push_point("a", Some(0.0), 1.5, Some(2.0)).unwrap();
+    state.push_point("b,c", Some(1.0), 2.0, None).unwrap();
+    state.push_point("a", Some(2.0), -3.0, Some(0.5)).unwrap();
+    assert_eq!(
+      state.to_csv(),
+      "series,x,y,z\na,0,1.5,2\na,2,-3,0.5\n\"b,c\",1,2,\n"
+    );
+  }
+
+  #[test]
+  fn all_have_z_looks_at_every_series() {
+    let mut state = PlotState::new();
+    assert!(state.all_have_z());
+    state.push_point("a", None, 1.0, Some(1.0)).unwrap();
+    assert!(state.all_have_z());
+    state.push_point("b", None, 1.0, None).unwrap();
+    assert!(!state.all_have_z());
   }
 }
