@@ -66,6 +66,7 @@ complot --close-all
 | `--clear`, `--close`, `--title T` | Clears the data, closes the window, sets the title. |
 | `NAME: … NAME: …` | Several plots in one call (see below). |
 | `--by COL` | Sends each CSV row to the plot named in column COL (see below). |
+| `--exec CMD` | Runs CMD and reads its output as CSV, without a shell pipe (see below). |
 | `--list` / `-l` | Lists the open plots. |
 | `--list-types` | Lists the plot types. |
 | `--close-all` | Closes every open plot. |
@@ -111,6 +112,29 @@ With `--create`, a plot is opened the first time its name appears, with the
 other options of the command line (aesthetic, type, title). Without it,
 naming a plot that is not open is an error and its rows are skipped. A plot
 whose window is closed during the stream is not reopened.
+
+## Running the producer: `--exec`
+
+`--exec CMD` makes complot run CMD itself (through `sh`, or `cmd` on Windows)
+and read its standard output as CSV, exactly like `-` reads a pipe:
+
+```sh
+complot p1: --exec "arduino-io.exe monitor --hz 100 --csv - 15"
+complot --by sensor --create --exec "./sensors"
+```
+
+It is a source like a file: before the first `NAME:` it feeds every plot, after
+one only that plot, and it works with `--by`, `--frames` and `#clear`. The
+producer's error messages still reach the terminal. When it exits, complot
+finishes (a non-zero exit status is reported). When every plot it feeds is
+closed, complot stops it, and Ctrl-C stops both.
+
+**On Windows, prefer `--exec` to a PowerShell pipe.** Between two programs,
+PowerShell's `|` is not a plain operating-system pipe: Windows PowerShell 5.1
+holds everything back until the producer exits, so a never-ending stream never
+reaches the plot, and PowerShell 7 delivers it in chunks, about once a second.
+`--exec` (or `cmd /c "producer | complot p1: -"`) streams line by line. On
+macOS and Linux, shell pipes are fine.
 
 ## Aesthetics
 

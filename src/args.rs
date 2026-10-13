@@ -85,11 +85,13 @@ where
 }
 
 /// The options of one plot: its own where given, else the shared ones. Files
-/// are its own only, since shared files are sent to every plot separately.
+/// and `--exec` are its own only, since shared sources are sent to every plot
+/// separately.
 pub fn merged(shared: &Cli, own: &Cli) -> Cli {
   Cli {
     name: None,
     files: own.files.clone(),
+    exec: own.exec.clone(),
     aes: pick(&own.aes, &shared.aes),
     x: own.x.or(shared.x),
     y: own.y.or(shared.y),
@@ -455,5 +457,48 @@ mod tests {
     let listing = Cli::try_parse_from(["complot", "--list"]).unwrap();
     let cli = merged(&listing, &listing);
     assert!(!cli.list && !cli.close_all && !cli.list_types && cli.serve.is_none());
+  }
+
+  #[test]
+  fn exec_is_parsed_in_single_and_multi() {
+    let cli = single(&["temp", "--exec", "./sensor"]);
+    assert_eq!(cli.name.as_deref(), Some("temp"));
+    assert_eq!(cli.exec.as_deref(), Some("./sensor"));
+
+    let (shared, plots) = multi(&["--exec", "shared", "a:", "--exec", "own", "b:"]);
+    assert_eq!(shared.exec.as_deref(), Some("shared"));
+    assert_eq!(plots[0].1.exec.as_deref(), Some("own"));
+    assert_eq!(plots[1].1.exec, None);
+  }
+
+  #[test]
+  fn merged_keeps_only_the_own_exec() {
+    let (shared, plots) = multi(&["--exec", "shared", "a:", "b:", "--exec", "own"]);
+    assert_eq!(merged(&shared, &plots[0].1).exec, None);
+    assert_eq!(merged(&shared, &plots[1].1).exec.as_deref(), Some("own"));
+  }
+
+  #[test]
+  fn exec_value_is_never_a_marker() {
+    let (_, plots) = multi(&["a:", "--exec", "cat:", "b:"]);
+    assert_eq!(plots.len(), 2);
+    assert_eq!(plots[0].1.exec.as_deref(), Some("cat:"));
+    assert_eq!(plots[1].0, "b");
+
+    let (_, plots) = multi(&["a:", "--exec", "x y:", "b:"]);
+    assert_eq!(plots.len(), 2);
+    assert_eq!(plots[0].1.exec.as_deref(), Some("x y:"));
+
+    let (_, plots) = multi(&["a:", "--exec=cat:", "b:"]);
+    assert_eq!(plots.len(), 2);
+    assert_eq!(plots[0].1.exec.as_deref(), Some("cat:"));
+  }
+
+  #[test]
+  fn by_with_exec_is_valid() {
+    let cli = single(&["--by", "sensor", "--exec", "./sensors"]);
+    assert_eq!(cli.by.as_deref(), Some("sensor"));
+    assert_eq!(cli.exec.as_deref(), Some("./sensors"));
+    assert!(cli.name.is_none() && cli.files.is_empty());
   }
 }

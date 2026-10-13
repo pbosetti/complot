@@ -11,8 +11,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
-use std::path::Path;
-use std::process::{Command, ExitCode, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command, ExitCode, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -27,6 +30,8 @@ const LOG_LINES: usize = 10;
 const BATCH_LINES: usize = 4096;
 /// Read buffer for CSV sources.
 const READ_BUFFER: usize = 65536;
+/// How often the watcher of an `--exec` command checks its plots.
+const WATCH_INTERVAL: Duration = Duration::from_millis(200);
 
 /// An authenticated connection to a plot server.
 pub struct Connection {
@@ -200,6 +205,8 @@ fn write_error(name: &str, e: io::Error) -> String {
 struct Session {
   name: String,
   writer: BufWriter<TcpStream>,
+  /// Cleared by the reply thread once the server has closed the connection.
+  alive: Arc<AtomicBool>,
   replies: JoinHandle<bool>,
 }
 
@@ -207,13 +214,15 @@ impl Session {
   /// Starts printing the replies on `conn` right away.
   fn open(name: &str, conn: Connection) -> Session {
     let Connection { mut reader, writer } = conn;
+    let alive = Arc::new(AtomicBool::new(true));
+    let flag = Arc::clone(&alive);
     let replies = thread::spawn(move || {
       let mut failed = false;
       let mut raw = Vec::new();
       loop {
         raw.clear();
         match reader.read_until(b'\n', &mut raw) {
-          Ok(0) | Err(_) => return failed,
+          Ok(0) | Err(_) => break,
           Ok(_) => {}
         }
         let text = String::from_utf8_lossy(&raw);
@@ -221,10 +230,13 @@ impl Session {
         failed |= line.starts_with(ERROR);
         eprintln!("complot: {line}");
       }
+      flag.store(false, Ordering::SeqCst);
+      failed
     });
     Session {
       name: name.to_string(),
       writer,
+      alive,
       replies,
     }
   }
@@ -236,6 +248,11 @@ impl Session {
       .map_err(|e| write_error(&self.name, e))
   }
 
+  /// False once the server has closed the connection.
+  fn is_alive(&self) -> bool {
+    self.alive.load(Ordering::SeqCst)
+  }
+
   /// Ends the connection and waits for the server to close its side.
   /// Returns true if the server reported an error.
   fn finish(self) -> Result<bool, String> {
@@ -243,6 +260,7 @@ impl Session {
       name,
       mut writer,
       replies,
+      ..
     } = self;
     writer.flush().map_err(|e| write_error(&name, e))?;
     // EOF tells the server this chunk is complete; it then closes the socket.
@@ -253,18 +271,286 @@ impl Session {
   }
 }
 
-fn read_error(path: &Path, e: io::Error) -> String {
-  format!("cannot read '{}': {e}", path.display())
+/// Ends `session` once its chunk is complete. A server that closed the
+/// connection before then has closed the plot's window, which is an error.
+fn end(session: Session) -> Result<bool, String> {
+  let name = session.name.clone();
+  let closed = !session.is_alive();
+  let result = session.finish();
+  if closed {
+    Err(format!("plot '{name}' was closed"))
+  } else {
+    result
+  }
 }
 
-/// Opens a CSV source (`-` for stdin) with a read buffer.
-fn open_source(path: &Path) -> Result<BufReader<Box<dyn Read>>, String> {
-  let source: Box<dyn Read> = if path == Path::new("-") {
-    Box::new(io::stdin())
-  } else {
-    Box::new(File::open(path).map_err(|e| read_error(path, e))?)
+/// Message for an I/O error while reading `source`.
+fn read_error(source: &Source, e: io::Error) -> String {
+  match source {
+    Source::Stdin => format!("cannot read '-': {e}"),
+    Source::File(path) => format!("cannot read '{}': {e}", path.display()),
+    Source::Exec(cmd) => format!("cannot read the output of '{cmd}': {e}"),
+  }
+}
+
+/// Where CSV lines come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+  /// `-`: the standard input.
+  Stdin,
+  /// A file.
+  File(PathBuf),
+  /// `--exec CMD`: the standard output of CMD.
+  Exec(String),
+}
+
+/// The sources of `cli`: its files in order, then its `--exec` command.
+fn sources(cli: &Cli) -> Vec<Source> {
+  let files = cli.files.iter().map(|path| {
+    if path == Path::new("-") {
+      Source::Stdin
+    } else {
+      Source::File(path.clone())
+    }
+  });
+  let exec = cli.exec.iter().map(|cmd| Source::Exec(cmd.clone()));
+  files.chain(exec).collect()
+}
+
+/// True if `cli` has CSV input: files, `-` or `--exec`.
+fn has_input(cli: &Cli) -> bool {
+  !cli.files.is_empty() || cli.exec.is_some()
+}
+
+/// Opens `source` with a read buffer. An `--exec` command is started too, and
+/// returned as its producer.
+fn open_source(source: &Source) -> Result<Input, String> {
+  let mut producer = None;
+  let reader: Box<dyn Read> = match source {
+    Source::Stdin => Box::new(io::stdin()),
+    Source::File(path) => Box::new(File::open(path).map_err(|e| read_error(source, e))?),
+    Source::Exec(cmd) => {
+      let (started, stdout) = Producer::start(cmd)?;
+      producer = Some(started);
+      Box::new(stdout)
+    }
   };
-  Ok(BufReader::with_capacity(READ_BUFFER, source))
+  Ok(Input {
+    lines: BufReader::with_capacity(READ_BUFFER, reader),
+    producer,
+  })
+}
+
+/// A source being read: its lines, and for `--exec` the command that makes them.
+struct Input {
+  lines: BufReader<Box<dyn Read>>,
+  producer: Option<Producer>,
+}
+
+/// A running `--exec` command. complot reads its standard output, and a
+/// watcher thread kills the command once every session it feeds is closed, so
+/// that an idle command does not outlive its plots.
+struct Producer {
+  running: Arc<Running>,
+  /// Dropping the sender ends the watcher.
+  watcher: Option<(Sender<()>, JoinHandle<()>)>,
+}
+
+/// The command of a [`Producer`], as its watcher shares it.
+struct Running {
+  child: Mutex<Child>,
+  /// Set once complot has killed the command.
+  killed: AtomicBool,
+  /// The `alive` flags of the sessions the command feeds.
+  feeds: Mutex<Vec<Arc<AtomicBool>>>,
+}
+
+impl Producer {
+  /// Runs `cmd` through the shell, with its standard output piped. Returns the
+  /// producer and the pipe to read.
+  fn start(cmd: &str) -> Result<(Producer, ChildStdout), String> {
+    let mut child = shell_command(cmd)
+      .stdin(Stdio::null())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::inherit())
+      .spawn()
+      .map_err(|e| format!("cannot run '{cmd}': {e}"))?;
+    let stdout = child
+      .stdout
+      .take()
+      .ok_or_else(|| format!("cannot read the output of '{cmd}'"))?;
+    let running = Arc::new(Running {
+      child: Mutex::new(child),
+      killed: AtomicBool::new(false),
+      feeds: Mutex::new(Vec::new()),
+    });
+    let watcher = watch(Arc::clone(&running));
+    let producer = Producer {
+      running,
+      watcher: Some(watcher),
+    };
+    Ok((producer, stdout))
+  }
+
+  /// Makes the watcher count `session` among the sessions it feeds.
+  fn feed(&self, session: &Session) {
+    lock(&self.running.feeds).push(Arc::clone(&session.alive));
+  }
+
+  /// Kills the command now, unless it has exited.
+  fn kill(&self) {
+    self.running.kill();
+  }
+
+  /// Waits for the command, once its output has ended. Returns the message for
+  /// a failure of its own: a non-zero status, or a death by signal.
+  fn finish(&mut self) -> Option<String> {
+    self.stop_watcher();
+    let status = lock(&self.running.child).wait();
+    match status {
+      Ok(status) if status.success() || self.running.was_killed() => None,
+      Ok(status) => Some(exit_message(status)),
+      Err(e) => Some(format!("cannot wait for the producer: {e}")),
+    }
+  }
+
+  /// Stops the watcher, and waits for its thread to end.
+  fn stop_watcher(&mut self) {
+    if let Some((stop, handle)) = self.watcher.take() {
+      drop(stop);
+      let _ = handle.join();
+    }
+  }
+}
+
+impl Drop for Producer {
+  /// Stops the command if it is still there, as after an error.
+  fn drop(&mut self) {
+    self.stop_watcher();
+    self.running.kill();
+    let _ = lock(&self.running.child).wait();
+  }
+}
+
+impl Running {
+  /// Kills the command, unless it has exited.
+  fn kill(&self) {
+    let mut child = lock(&self.child);
+    if matches!(child.try_wait(), Ok(None)) {
+      self.killed.store(true, Ordering::SeqCst);
+      kill_process(&mut child);
+    }
+  }
+
+  /// True if complot killed the command.
+  fn was_killed(&self) -> bool {
+    self.killed.load(Ordering::SeqCst)
+  }
+
+  /// True if at least one session is fed and all of them are closed.
+  fn feeds_closed(&self) -> bool {
+    let feeds = lock(&self.feeds);
+    !feeds.is_empty() && feeds.iter().all(|alive| !alive.load(Ordering::SeqCst))
+  }
+}
+
+/// Starts the watcher of `running`. Every `WATCH_INTERVAL` it kills the command
+/// once its plots are all closed, and it ends when the returned sender is dropped.
+fn watch(running: Arc<Running>) -> (Sender<()>, JoinHandle<()>) {
+  let (stop, stopped) = mpsc::channel::<()>();
+  let handle = thread::spawn(move || {
+    while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(WATCH_INTERVAL) {
+      if running.feeds_closed() {
+        running.kill();
+        break;
+      }
+    }
+  });
+  (stop, handle)
+}
+
+/// The command that runs `cmd` through the shell.
+#[cfg(unix)]
+fn shell_command(cmd: &str) -> Command {
+  let mut command = Command::new("sh");
+  command.arg("-c").arg(cmd);
+  command
+}
+
+/// The command that runs `cmd` through cmd. The text is passed verbatim, and
+/// `/S` strips just the outer quotes.
+#[cfg(windows)]
+fn shell_command(cmd: &str) -> Command {
+  use std::os::windows::process::CommandExt;
+  let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+  let mut command = Command::new(shell);
+  command
+    .args(["/D", "/S", "/C"])
+    .raw_arg(format!("\"{cmd}\""));
+  command
+}
+
+/// On Windows a child process inherits every inheritable handle of its parent,
+/// whatever its own stdio is. A plot window started from
+/// `$h = complot …` in PowerShell would so keep PowerShell's capture pipe open,
+/// and the assignment would hang until the window is closed. Our own standard
+/// handles are therefore made non-inheritable: children get only the handles
+/// passed to them explicitly (Rust passes an inherited stderr as a duplicate).
+#[cfg(windows)]
+fn keep_std_handles_private() {
+  type Handle = *mut std::ffi::c_void;
+  const STD_HANDLES: [u32; 3] = [-10i32 as u32, -11i32 as u32, -12i32 as u32];
+  const HANDLE_FLAG_INHERIT: u32 = 1;
+  #[link(name = "kernel32")]
+  unsafe extern "system" {
+    fn GetStdHandle(which: u32) -> Handle;
+    fn SetHandleInformation(handle: Handle, mask: u32, flags: u32) -> i32;
+  }
+  for which in STD_HANDLES {
+    // SAFETY: plain Win32 calls on this process's own standard handles;
+    // a missing or invalid handle is skipped, and failures are harmless.
+    unsafe {
+      let handle = GetStdHandle(which);
+      if !handle.is_null() && handle as isize != -1 {
+        SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+      }
+    }
+  }
+}
+
+/// Nothing to do on Unix, where `Command` closes everything but the child's stdio.
+#[cfg(unix)]
+fn keep_std_handles_private() {}
+
+/// Kills `child`. On Windows the processes that cmd started are killed too,
+/// since they would otherwise keep the output pipe open.
+#[cfg(unix)]
+fn kill_process(child: &mut Child) {
+  let _ = child.kill();
+}
+
+#[cfg(windows)]
+fn kill_process(child: &mut Child) {
+  let pid = child.id().to_string();
+  let _ = Command::new("taskkill")
+    .args(["/T", "/F", "/PID", pid.as_str()])
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status();
+  let _ = child.kill();
+}
+
+/// The message for a producer that failed on its own.
+fn exit_message(status: ExitStatus) -> String {
+  match status.code() {
+    Some(code) => format!("producer exited with status {code}"),
+    None => format!("producer exited with status {status}"),
+  }
+}
+
+/// Locks `m`. A poisoned lock still holds valid data, so it is taken anyway.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+  m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Removes the line break that ends `raw`: a `\n`, then a `\r`.
@@ -304,20 +590,28 @@ fn open_chunk(name: &str, conn: Connection, frames: bool) -> Result<Session, Str
   Ok(session)
 }
 
-/// Pushes the lines of `path` (`-` for stdin) to every plot in `plots`, each
-/// over a connection of its own, so that each file is one CSV chunk per plot.
-/// The plots are `(name, frames)` pairs: with `frames`, the chunk starts with
-/// `Frames`. The source is read once, and each batch goes to every plot still
-/// open. A plot that is lost is reported and dropped; the others go on, and
-/// the source is not read any further once none is left.
-fn push_file(plots: &[(String, bool)], path: &Path) -> Result<Push, String> {
-  let mut lines = open_source(path)?;
+/// Pushes the CSV of `source` to every plot in `plots`, each over a connection
+/// of its own, so that each source is one CSV chunk per plot. The plots are
+/// `(name, frames)` pairs: with `frames`, the chunk starts with `Frames`. The
+/// source is read once, and each batch goes to every plot still open. A plot
+/// that is lost is reported and dropped; the others go on, and the source is
+/// not read any further once none is left. An `--exec` command is stopped then.
+fn push_source(plots: &[(String, bool)], source: &Source) -> Result<Push, String> {
+  let Input {
+    mut lines,
+    mut producer,
+  } = open_source(source)?;
   let mut push = Push::default();
   let mut sessions = Vec::new();
   for (plot, frames) in plots {
     match connect(plot) {
       Ok(conn) => match open_chunk(plot, conn, *frames) {
-        Ok(session) => sessions.push(session),
+        Ok(session) => {
+          if let Some(producer) = &producer {
+            producer.feed(&session);
+          }
+          sessions.push(session);
+        }
         Err(msg) => push.lose(plot, msg),
       },
       Err(e) => push.lose(plot, connect_error(plot, e)),
@@ -326,13 +620,15 @@ fn push_file(plots: &[(String, bool)], path: &Path) -> Result<Push, String> {
 
   let mut batch = Vec::new();
   let mut raw = Vec::new();
+  let mut eof = false;
   while !sessions.is_empty() {
     raw.clear();
     if lines
       .read_until(b'\n', &mut raw)
-      .map_err(|e| read_error(path, e))?
+      .map_err(|e| read_error(source, e))?
       == 0
     {
+      eof = true;
       break;
     }
     strip_newline(&mut raw);
@@ -347,12 +643,27 @@ fn push_file(plots: &[(String, bool)], path: &Path) -> Result<Push, String> {
   if !batch.is_empty() {
     fan_out(&mut sessions, &batch, &mut push);
   }
+  if let Some(producer) = producer.as_mut() {
+    // Reading is over, so the watcher stops here. Ending the sessions below
+    // makes their servers close, which must not look like every plot is gone.
+    producer.stop_watcher();
+    // No plot is left to read for, so the command is stopped before its output ends.
+    if !eof {
+      producer.kill();
+    }
+  }
   for session in sessions {
     let plot = session.name.clone();
-    match session.finish() {
+    match end(session) {
       Ok(failed) => push.failed |= failed,
       Err(msg) => push.lose(&plot, msg),
     }
+  }
+  if let Some(producer) = producer.as_mut()
+    && let Some(msg) = producer.finish()
+  {
+    eprintln!("complot: {msg}");
+    push.failed = true;
   }
   Ok(push)
 }
@@ -386,6 +697,7 @@ fn types_text() -> String {
 
 /// Runs a client invocation; never called with `--serve`.
 pub fn run(inv: &Invocation) -> ExitCode {
+  keep_std_handles_private();
   let result = match inv {
     Invocation::Single(cli) if cli.by.is_some() => route_rows(cli),
     Invocation::Single(cli) => execute(cli),
@@ -421,7 +733,7 @@ fn execute(cli: &Cli) -> Result<bool, String> {
     return Ok(false);
   }
 
-  let has_data = !cli.files.is_empty() || cli.y.is_some();
+  let has_data = has_input(cli) || cli.y.is_some();
   let name = match &cli.name {
     Some(name) => name.clone(),
     None if has_data => return Err("a plot name is required to push data".into()),
@@ -445,8 +757,8 @@ fn execute(cli: &Cli) -> Result<bool, String> {
   };
 
   let mut failed = send_all(&name, first, &setup_messages(cli, aes.as_ref(), true))?;
-  for path in &cli.files {
-    let push = push_file(&[(name.clone(), cli.frames)], path)?;
+  for source in sources(cli) {
+    let push = push_source(&[(name.clone(), cli.frames)], &source)?;
     failed |= push.failed;
     if !push.closed.is_empty() {
       // The window is gone: nothing more to send, not even `--close`.
@@ -591,7 +903,7 @@ fn execute_multi(shared: &Cli, plots: &[(String, Cli)]) -> Result<bool, String> 
     let cli = args::merged(shared, own);
     check_options(&cli)?;
     let aes = parse_aes(&cli)?;
-    let has_data = !shared.files.is_empty() || !cli.files.is_empty() || cli.y.is_some();
+    let has_data = has_input(shared) || has_input(&cli) || cli.y.is_some();
     plans.push(Plan {
       name: name.clone(),
       cli,
@@ -648,8 +960,8 @@ fn execute_multi(shared: &Cli, plots: &[(String, Cli)]) -> Result<bool, String> 
     }
   }
 
-  // Each shared file is read once, and goes to every plot that is still there.
-  for path in &shared.files {
+  // Each shared source is read once, and goes to every plot that is still there.
+  for source in sources(shared) {
     let targets: Vec<(String, bool)> = plans
       .iter()
       .filter(|plan| !plan.gone)
@@ -658,7 +970,7 @@ fn execute_multi(shared: &Cli, plots: &[(String, Cli)]) -> Result<bool, String> 
     if targets.is_empty() {
       break;
     }
-    let push = push_file(&targets, path)?;
+    let push = push_source(&targets, &source)?;
     failed |= push.failed;
     for plan in plans
       .iter_mut()
@@ -668,10 +980,10 @@ fn execute_multi(shared: &Cli, plots: &[(String, Cli)]) -> Result<bool, String> 
     }
   }
 
-  // Each plot's own files go to that plot alone.
+  // Each plot's own sources go to that plot alone.
   for plan in plans.iter_mut().filter(|plan| !plan.gone) {
-    for path in &plan.cli.files {
-      let push = push_file(&[(plan.name.clone(), plan.cli.frames)], path)?;
+    for source in sources(&plan.cli) {
+      let push = push_source(&[(plan.name.clone(), plan.cli.frames)], &source)?;
       failed |= push.failed;
       if !push.closed.is_empty() {
         plan.gone = true;
@@ -766,8 +1078,8 @@ impl Routing {
 /// configuration, then the header, then the rows. `Ok(true)` if a server
 /// reported an error, a write failed, or a plot was not open.
 fn route_rows(cli: &Cli) -> Result<bool, String> {
-  if cli.files.is_empty() {
-    return Err("--by needs CSV input (files or -)".into());
+  if !has_input(cli) {
+    return Err("--by needs CSV input (files, - or --exec)".into());
   }
   check_options(cli)?;
   let aes = parse_aes(cli)?;
@@ -782,8 +1094,8 @@ fn route_rows(cli: &Cli) -> Result<bool, String> {
     rejected: 0,
     failed: false,
   };
-  for path in &cli.files {
-    route_source(&mut run, col, path)?;
+  for source in sources(cli) {
+    route_source(&mut run, col, &source)?;
   }
   if run.rejected > run.printed.len() as u64 {
     eprintln!("complot: warn: {} rows rejected in all", run.rejected);
@@ -800,9 +1112,12 @@ fn route_rows(cli: &Cli) -> Result<bool, String> {
   Ok(run.failed)
 }
 
-/// Routes the rows of one CSV source (`-` for stdin) on column `col`.
-fn route_source(run: &mut Routing, col: &str, path: &Path) -> Result<(), String> {
-  let mut lines = open_source(path)?;
+/// Routes the rows of one CSV source on column `col`.
+fn route_source(run: &mut Routing, col: &str, source: &Source) -> Result<(), String> {
+  let Input {
+    mut lines,
+    mut producer,
+  } = open_source(source)?;
   let mut router = Router::new(col);
   let mut feeds: BTreeMap<String, Feed> = BTreeMap::new();
   let mut raw = Vec::new();
@@ -810,7 +1125,7 @@ fn route_source(run: &mut Routing, col: &str, path: &Path) -> Result<(), String>
     raw.clear();
     if lines
       .read_until(b'\n', &mut raw)
-      .map_err(|e| read_error(path, e))?
+      .map_err(|e| read_error(source, e))?
       == 0
     {
       break;
@@ -850,6 +1165,9 @@ fn route_source(run: &mut Routing, col: &str, path: &Path) -> Result<(), String>
           if !feeds.contains_key(&plot)
             && let Some(feed) = open_feed(run, &plot, router.header())
           {
+            if let Some(producer) = &producer {
+              producer.feed(&feed.session);
+            }
             feeds.insert(plot.clone(), feed);
           }
           if let Some(feed) = feeds.get_mut(&plot) {
@@ -862,7 +1180,7 @@ fn route_source(run: &mut Routing, col: &str, path: &Path) -> Result<(), String>
         }
       }
     }
-    // The same rule as push_file: send when the next read would block, or
+    // The same rule as push_source: send when the next read would block, or
     // when a batch is full.
     let full = feeds.values().any(|feed| feed.batch.len() >= BATCH_LINES);
     if full || !lines.buffer().contains(&b'\n') {
@@ -870,11 +1188,21 @@ fn route_source(run: &mut Routing, col: &str, path: &Path) -> Result<(), String>
     }
   }
   flush_feeds(&mut feeds, run);
+  if let Some(producer) = producer.as_mut() {
+    // As in push_source: ending the feeds below must not stop the command.
+    producer.stop_watcher();
+  }
   for (plot, feed) in feeds {
-    match feed.session.finish() {
+    match end(feed.session) {
       Ok(failed) => run.failed |= failed,
       Err(msg) => run.drop_plot(&plot, msg),
     }
+  }
+  if let Some(producer) = producer.as_mut()
+    && let Some(msg) = producer.finish()
+  {
+    eprintln!("complot: {msg}");
+    run.failed = true;
   }
   Ok(())
 }
@@ -1192,7 +1520,8 @@ mod tests {
       })
       .collect();
     fs::write(&path, text).unwrap();
-    let pushed = push_file(&[(name.to_string(), false)], &path).map(|push| push.failed);
+    let source = Source::File(path.clone());
+    let pushed = push_source(&[(name.to_string(), false)], &source).map(|push| push.failed);
     fs::remove_file(&path).unwrap();
     assert_eq!(pushed, Ok(false));
     registry::remove_entry(name);
@@ -1248,7 +1577,8 @@ mod tests {
 
     let path = registry::dir().join("cl_err.csv");
     fs::write(&path, "a,b\n1,2\n").unwrap();
-    let pushed = push_file(&[(name.to_string(), false)], &path).map(|push| push.failed);
+    let source = Source::File(path.clone());
+    let pushed = push_source(&[(name.to_string(), false)], &source).map(|push| push.failed);
     fs::remove_file(&path).unwrap();
     assert_eq!(pushed, Ok(true));
     server.join().unwrap();
@@ -1649,5 +1979,264 @@ mod tests {
 
     assert_eq!(rows_of(&a[0]), ["t,v", "0,1", "#clear", "u,w", "1,2"]);
     registry::remove_entry("byh_a");
+  }
+
+  #[test]
+  fn sources_are_the_files_in_order_then_the_exec() {
+    let cli = single(&["--by", "s", "-", "a.csv", "--exec", "cat"]);
+    assert_eq!(
+      sources(&cli),
+      [
+        Source::Stdin,
+        Source::File("a.csv".into()),
+        Source::Exec("cat".into()),
+      ]
+    );
+  }
+
+  /// True if a process with `pid` exists.
+  #[cfg(unix)]
+  fn process_alive(pid: &str) -> bool {
+    let script = format!("kill -0 {pid} 2>/dev/null");
+    Command::new("sh")
+      .arg("-c")
+      .arg(script)
+      .status()
+      .is_ok_and(|status| status.success())
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn exec_rows_reach_the_plot() {
+    registry::init_test_dir();
+    let name = "ex_rows";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token = register(name, &listener);
+    let server = fake_chunks(listener, name, &token, 2, None);
+
+    let cli = single(&[name, "--exec", "printf 't,v\\n0,1\\n1,2\\n'"]);
+    let result = execute(&cli);
+    let chunks = server.join().unwrap();
+    registry::remove_entry(name);
+
+    assert_eq!(result, Ok(false));
+    assert!(chunks[0].is_empty());
+    assert_eq!(rows_of(&chunks[1]), ["t,v", "0,1", "1,2"]);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn shared_exec_fans_out_to_every_plot_and_runs_once() {
+    registry::init_test_dir();
+    let runs = registry::dir().join("fx_runs.txt");
+    let script = format!(
+      "printf 't,v\\n0,1\\n1,2\\n'; echo run >> '{}'",
+      runs.display()
+    );
+    let mut servers = Vec::new();
+    for name in ["fx_a", "fx_b"] {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      let token = register(name, &listener);
+      servers.push(fake_chunks(listener, name, &token, 2, None));
+    }
+    let (shared, plots) = multi(&["--exec", script.as_str(), "fx_a:", "fx_b:"]);
+
+    let result = execute_multi(&shared, &plots);
+    let b = servers.remove(1).join().unwrap();
+    let a = servers.remove(0).join().unwrap();
+    let runs_count = fs::read_to_string(&runs).unwrap().lines().count();
+    fs::remove_file(&runs).unwrap();
+    registry::remove_entry("fx_a");
+    registry::remove_entry("fx_b");
+
+    assert_eq!(result, Ok(false));
+    assert_eq!(runs_count, 1);
+    for chunks in [&a, &b] {
+      assert!(chunks[0].is_empty());
+      assert_eq!(rows_of(&chunks[1]), ["t,v", "0,1", "1,2"]);
+    }
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn own_exec_goes_to_its_plot_alone() {
+    registry::init_test_dir();
+    let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token_a = register("oe_a", &listener_a);
+    let server_a = fake_chunks(listener_a, "oe_a", &token_a, 2, None);
+    let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token_b = register("oe_b", &listener_b);
+    let server_b = fake_chunks(listener_b, "oe_b", &token_b, 1, None);
+    let (shared, plots) = multi(&["oe_a:", "--exec", "printf 't,v\\n0,1\\n'", "oe_b:"]);
+
+    let result = execute_multi(&shared, &plots);
+    let b = server_b.join().unwrap();
+    let a = server_a.join().unwrap();
+    registry::remove_entry("oe_a");
+    registry::remove_entry("oe_b");
+
+    assert_eq!(result, Ok(false));
+    assert_eq!(rows_of(&a[1]), ["t,v", "0,1"]);
+    assert_eq!(b.len(), 1);
+    assert!(b[0].is_empty());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn by_routes_exec_rows_to_their_plots() {
+    registry::init_test_dir();
+    let mut servers = Vec::new();
+    for name in ["rx_a", "rx_b"] {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      let token = register(name, &listener);
+      servers.push(fake_chunks(listener, name, &token, 1, None));
+    }
+    let cli = single(&[
+      "--by",
+      "s",
+      "--exec",
+      "printf 't,s,v\\n0,rx_a,1\\n1,rx_b,2\\n2,rx_a,3\\n'",
+    ]);
+
+    let result = route_rows(&cli);
+    let b = servers.remove(1).join().unwrap();
+    let a = servers.remove(0).join().unwrap();
+    registry::remove_entry("rx_a");
+    registry::remove_entry("rx_b");
+
+    assert_eq!(result, Ok(false));
+    assert_eq!(rows_of(&a[0]), ["t,v", "0,1", "2,3"]);
+    assert_eq!(rows_of(&b[0]), ["t,v", "1,2"]);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn exec_that_fails_makes_the_run_fail() {
+    registry::init_test_dir();
+    let name = "ex_fail";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token = register(name, &listener);
+    let server = fake_chunks(listener, name, &token, 2, None);
+
+    let result = execute(&single(&[name, "--exec", "exit 3"]));
+    let chunks = server.join().unwrap();
+    registry::remove_entry(name);
+
+    assert_eq!(result, Ok(true));
+    assert!(chunks[1].is_empty());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn exec_failure_names_the_status_or_signal() {
+    let (mut producer, mut out) = Producer::start("exit 3").unwrap();
+    let mut text = Vec::new();
+    out.read_to_end(&mut text).unwrap();
+    assert!(text.is_empty());
+    assert_eq!(
+      producer.finish(),
+      Some("producer exited with status 3".to_string())
+    );
+
+    let (mut producer, mut out) = Producer::start("kill -9 $$").unwrap();
+    out.read_to_end(&mut text).unwrap();
+    let message = producer.finish().unwrap();
+    assert!(
+      message.starts_with("producer exited with status signal: 9"),
+      "{message}"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn exec_is_killed_when_its_plot_closes() {
+    registry::init_test_dir();
+    let name = "ex_kill";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token = register(name, &listener);
+    // The server reads one batch, then closes its window.
+    let server = fake_chunks(listener, name, &token, 2, Some(1));
+    let pidfile = registry::dir().join("ex_kill.pid");
+    let script = format!(
+      "echo $$ > '{}'; while :; do echo 0,1; sleep 0.05; done",
+      pidfile.display()
+    );
+
+    let started = Instant::now();
+    let result = execute(&single(&[name, "--exec", script.as_str()]));
+    let elapsed = started.elapsed();
+    server.join().unwrap();
+    let pid = fs::read_to_string(&pidfile).unwrap();
+    fs::remove_file(&pidfile).unwrap();
+    registry::remove_entry(name);
+
+    assert_eq!(result, Ok(true));
+    assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    assert!(!process_alive(pid.trim()), "sh {} still runs", pid.trim());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn idle_exec_is_killed_when_its_plot_closes() {
+    registry::init_test_dir();
+    let name = "ex_idle";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token = register(name, &listener);
+    // The server closes its window right after the handshake, and the
+    // command never writes anything.
+    let server = fake_chunks(listener, name, &token, 1, Some(0));
+    let source = Source::Exec("sleep 30".to_string());
+
+    let started = Instant::now();
+    let result = push_source(&[(name.to_string(), false)], &source);
+    let elapsed = started.elapsed();
+    server.join().unwrap();
+    registry::remove_entry(name);
+
+    let push = result.unwrap();
+    assert!(push.failed);
+    assert_eq!(push.closed, [name]);
+    assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn exit_status_after_the_output_ends_is_reported() {
+    registry::init_test_dir();
+    let name = "ex_late";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token = register(name, &listener);
+    // The server closes its side 0.6 s after the chunk ends, as a plot does
+    // when the chunk is finished and its window is still open for a while.
+    let server = thread::spawn(move || {
+      let (stream, _) = listener.accept().unwrap();
+      let mut writer = stream.try_clone().unwrap();
+      let mut reader = BufReader::new(stream);
+      assert_eq!(
+        protocol::recv(&mut reader).unwrap(),
+        Some(Msg::Hello { token })
+      );
+      writer
+        .write_all(format!("{GREETING} {name}\n").as_bytes())
+        .unwrap();
+      let mut msgs = Vec::new();
+      while let Some(msg) = protocol::recv(&mut reader).unwrap() {
+        msgs.push(msg);
+      }
+      thread::sleep(Duration::from_millis(600));
+      msgs
+    });
+    // The output ends after 0.3 s, and the command fails a second later. Its
+    // plot ending normally must not make the watcher stop the command.
+    let source = Source::Exec("echo 0,1; sleep 0.3; exec 1>&-; sleep 1; exit 2".to_string());
+
+    let push = push_source(&[(name.to_string(), false)], &source);
+    let msgs = server.join().unwrap();
+    registry::remove_entry(name);
+
+    let push = push.unwrap();
+    assert!(push.failed, "the exit status was lost");
+    assert!(push.closed.is_empty());
+    assert_eq!(rows_of(&msgs), ["0,1"]);
   }
 }

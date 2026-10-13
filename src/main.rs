@@ -37,6 +37,7 @@ the first NAME: apply to every plot; every other argument belongs to the NAME:
 before it, and all positionals are then files.
   complot -x 3 temp: -y 21.5 pres: -y 1013
   tail -f log.csv | complot - temp: --aes \"x=t y=temp\" pres: --aes \"x=t y=pres\"
+  complot temp: -c --aes \"x=t y=temp\" --exec \"./sensor\"
 
 Routing: --by COL sends each CSV row to the plot named by its value in column
 COL (that column is not forwarded).
@@ -48,6 +49,11 @@ pub struct Cli {
 
   /// CSV files to push; `-` reads stdin and streams it line by line.
   pub files: Vec<PathBuf>,
+
+  /// Run CMD (through sh, or cmd on Windows) and read its standard output as CSV,
+  /// like `-` but without a shell pipe.
+  #[arg(long, value_name = "CMD")]
+  pub exec: Option<String>,
 
   /// Aesthetic mapping, e.g. "x=t y=a,b g=sensor".
   #[arg(long)]
