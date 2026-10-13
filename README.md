@@ -24,6 +24,12 @@ tail -f log.csv | complot $h -              # stream stdin, live
 complot $h --close
 ```
 
+
+
+https://github.com/user-attachments/assets/13c74d11-5448-4ea7-98cc-23b353c450c1
+
+
+
 ## Install
 
 | Platform | Command |
