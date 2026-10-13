@@ -125,6 +125,10 @@ few graphical settings:
 - **Histogram**: Sturges or Scott bins, side-by-side or stacked bars.
 - **3D**: perspective on or off, reset view. Drag rotates, scroll zooms,
   double-click resets; a click on a legend entry hides its series.
+- **Scale**: log x, log y and, in 3D, log z. Ticks sit at the decades and read
+  as values (1, 10, 100, 1e5). In a histogram, log x bins the logarithm of the
+  values and log y puts the counts on a log axis. Values ≤ 0 can't be shown on
+  a log axis; they are left out and counted in the status line.
 - Legend, grid, follow (auto-fit while data arrives), a per-series buffer
   limit for rolling windows, clearing the data and copying it as CSV.
 

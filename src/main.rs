@@ -10,6 +10,7 @@ mod lod;
 mod model;
 mod protocol;
 mod registry;
+mod scale;
 mod server;
 #[cfg(test)]
 mod snapshot;

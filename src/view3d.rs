@@ -1,8 +1,10 @@
 //! 3D view: an orbiting camera over boxed axes, drawn with egui's painter.
 
+use crate::scale;
 use eframe::egui;
 use egui_plot::PlotPoint;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// One series to draw in 3D.
 pub struct Series3d<'a> {
@@ -32,6 +34,8 @@ pub struct View3d {
   pub legend: bool,
   /// Names of the series hidden by clicking their legend entry.
   pub hidden: HashSet<String>,
+  /// Log scale on the x, y and z axes. Points with a coordinate ≤ 0 on a log axis are left out.
+  pub log: [bool; 3],
 }
 
 impl Default for View3d {
@@ -46,6 +50,7 @@ impl Default for View3d {
       line_width: 1.5,
       legend: true,
       hidden: HashSet::new(),
+      log: [false; 3],
     }
   }
 }
@@ -57,6 +62,8 @@ pub struct Drawn {
   pub marks: usize,
   /// Points of the visible series.
   pub total: usize,
+  /// Points left out because a coordinate is ≤ 0 on a log axis.
+  pub dropped: usize,
 }
 
 /// Distance from the camera to the centre of the box, in box half-sizes, for perspective.
@@ -73,9 +80,13 @@ const ZOOM_MAX: f32 = 20.0;
 const MAX_ELEVATION_DEG: f32 = 89.0;
 /// Ticks per axis.
 const TICKS: usize = 5;
+/// Ticks per log axis: every decade of a span of up to this many, see `scale::log_ticks`.
+const LOG_TICKS: usize = 8;
 /// Distance in points from an edge to its tick labels, and to its axis title.
 const TICK_OFFSET: f32 = 14.0;
 const TITLE_OFFSET: f32 = 34.0;
+/// Space in points between the outermost tick label of an axis and its title.
+const TITLE_GAP: f32 = 6.0;
 /// Smallest distance in points between two kept line vertices.
 const MIN_LINE_GAP: f32 = 0.5;
 /// Legend geometry in points: swatch size, gap after the swatch, padding of a row, margin to the corner.
@@ -125,7 +136,7 @@ impl View3d {
       }
     }
 
-    let ranges = data_ranges(series, &self.hidden);
+    let ranges = data_ranges(series, &self.hidden, self.log);
     let cam = Camera::new(
       rect,
       self.azimuth,
@@ -133,13 +144,14 @@ impl View3d {
       self.zoom,
       self.perspective,
     );
-    draw_box(ui, &painter, &cam, ranges, labels);
-    let (marks, total) = self.draw_series(&painter, &cam, ranges, series);
+    draw_box(ui, &painter, &cam, ranges, self.log, labels);
+    let (marks, total, dropped) = self.draw_series(&painter, &cam, ranges, series);
     self.draw_legend(ui, &painter, &font, &rows, series);
     Drawn {
       response,
       marks,
       total,
+      dropped,
     }
   }
 
@@ -158,37 +170,51 @@ impl View3d {
     }
   }
 
-  /// Draws the visible series after decimation. Returns the marks drawn and the points seen.
+  /// Draws the visible series after decimation. Returns the marks drawn, the points seen and the
+  /// points left out by a log axis.
   fn draw_series(
     &self,
     painter: &egui::Painter,
     cam: &Camera,
     ranges: [(f64, f64); 3],
     series: &[Series3d<'_>],
-  ) -> (usize, usize) {
-    let (mut marks, mut total) = (0, 0);
+  ) -> (usize, usize, usize) {
+    let (mut marks, mut total, mut dropped) = (0, 0, 0);
     for s in series.iter().filter(|s| !self.hidden.contains(s.name)) {
       total += s.xy.len().min(s.z.len());
+      dropped += s
+        .xy
+        .iter()
+        .zip(s.z)
+        .filter(|&(p, &z)| log_dropped([p.x, p.y, z], self.log))
+        .count();
       if s.lines {
-        let line = decimate_line(projected(s, ranges, *cam), MIN_LINE_GAP);
-        marks += line.len();
-        if line.len() >= 2 {
-          painter.add(egui::Shape::line(
-            line,
-            egui::Stroke::new(self.line_width, s.color),
-          ));
+        // Each run of drawable points is a line of its own, decimated on its own.
+        for run in line_runs(s.xy, s.z, self.log) {
+          let positions = run.into_iter().filter_map(|v| screen(cam, ranges, v));
+          let line = decimate_line(positions, MIN_LINE_GAP);
+          marks += line.len();
+          if line.len() >= 2 {
+            painter.add(egui::Shape::line(
+              line,
+              egui::Stroke::new(self.line_width, s.color),
+            ));
+          }
         }
       }
       if s.points {
         let cell = self.point_radius.max(1.0);
-        let kept = decimate_points(projected(s, ranges, *cam), cam.rect, cell);
+        let positions = space_points(s.xy, s.z, self.log)
+          .flatten()
+          .filter_map(|v| screen(cam, ranges, v));
+        let kept = decimate_points(positions, cam.rect, cell);
         marks += kept.len();
         for p in kept {
           painter.circle_filled(p, self.point_radius, s.color);
         }
       }
     }
-    (marks, total)
+    (marks, total, dropped)
   }
 
   /// Draws the legend rows from `legend_rows`, on a background, with a swatch and name each.
@@ -339,21 +365,22 @@ fn to_unit(v: f64, (lo, hi): (f64, f64)) -> f32 {
   (2.0 * (v / 2.0 - lo / 2.0) / (hi / 2.0 - lo / 2.0) - 1.0) as f32
 }
 
-/// Range of each axis over the finite points of the visible series, widened where it is flat.
-/// `[0, 1]` when there are no points.
-fn data_ranges(series: &[Series3d<'_>], hidden: &HashSet<String>) -> [(f64, f64); 3] {
+/// Range of each axis over the drawable points of the visible series, in the space of the box
+/// (exponents on a log axis), widened where it is flat. `[0, 1]` when there are no points.
+fn data_ranges(
+  series: &[Series3d<'_>],
+  hidden: &HashSet<String>,
+  log: [bool; 3],
+) -> [(f64, f64); 3] {
   let mut lo = [f64::INFINITY; 3];
   let mut hi = [f64::NEG_INFINITY; 3];
   let mut any = false;
   for s in series.iter().filter(|s| !hidden.contains(s.name)) {
-    for (p, &z) in s.xy.iter().zip(s.z) {
-      let v = [p.x, p.y, z];
-      if v.iter().all(|c| c.is_finite()) {
-        any = true;
-        for (a, &c) in v.iter().enumerate() {
-          lo[a] = lo[a].min(c);
-          hi[a] = hi[a].max(c);
-        }
+    for v in space_points(s.xy, s.z, log).flatten() {
+      any = true;
+      for (a, &c) in v.iter().enumerate() {
+        lo[a] = lo[a].min(c);
+        hi[a] = hi[a].max(c);
       }
     }
   }
@@ -369,22 +396,78 @@ fn data_ranges(series: &[Series3d<'_>], hidden: &HashSet<String>) -> [(f64, f64)
   })
 }
 
-/// Screen positions of the finite points of `s`, in order, as seen by `cam`.
-fn projected<'a>(
-  s: &Series3d<'a>,
-  ranges: [(f64, f64); 3],
-  cam: Camera,
-) -> impl Iterator<Item = egui::Pos2> + 'a {
-  let (xy, z): (&'a [PlotPoint], &'a [f64]) = (s.xy, s.z);
+/// The coordinates of a point in the space the box is drawn in: log10 on the log axes. None when
+/// a coordinate is not finite, or not positive on a log axis.
+fn to_space(v: [f64; 3], log: [bool; 3]) -> Option<[f64; 3]> {
+  let mut out = [0.0; 3];
+  for ((o, c), is_log) in out.iter_mut().zip(v).zip(log) {
+    *o = if is_log {
+      scale::to_log(c)?
+    } else {
+      c.is_finite().then_some(c)?
+    };
+  }
+  Some(out)
+}
+
+/// Whether a coordinate ≤ 0 on a log axis leaves the point out of the plot.
+fn log_dropped(v: [f64; 3], log: [bool; 3]) -> bool {
+  log.iter().zip(v).any(|(&is_log, c)| is_log && c <= 0.0)
+}
+
+/// The points of a series in the space of the box (see `to_space`), in order. A point left out by
+/// a log axis gives `Some(None)`, which ends a line; a point that is not finite is skipped.
+fn space_points<'a>(
+  xy: &'a [PlotPoint],
+  z: &'a [f64],
+  log: [bool; 3],
+) -> impl Iterator<Item = Option<[f64; 3]>> + 'a {
   xy.iter().zip(z).filter_map(move |(p, &zv)| {
-    let unit = [
-      to_unit(p.x, ranges[0]),
-      to_unit(p.y, ranges[1]),
-      to_unit(zv, ranges[2]),
-    ];
-    let pos = cam.project(unit).0;
-    pos.is_finite().then_some(pos)
+    let v = [p.x, p.y, zv];
+    if log_dropped(v, log) {
+      Some(None)
+    } else {
+      to_space(v, log).map(Some)
+    }
   })
+}
+
+/// The runs of consecutive drawable points of a line. A point left out by a log axis ends a run;
+/// a point that is not finite is skipped without ending it.
+fn line_runs(xy: &[PlotPoint], z: &[f64], log: [bool; 3]) -> Vec<Vec<[f64; 3]>> {
+  let mut runs = Vec::new();
+  let mut run = Vec::new();
+  for point in space_points(xy, z, log) {
+    match point {
+      Some(v) => run.push(v),
+      None => {
+        if !run.is_empty() {
+          runs.push(std::mem::take(&mut run));
+        }
+      }
+    }
+  }
+  if !run.is_empty() {
+    runs.push(run);
+  }
+  runs
+}
+
+/// Screen position of a point in the space of the box, or None if it is not finite on screen.
+fn screen(cam: &Camera, ranges: [(f64, f64); 3], v: [f64; 3]) -> Option<egui::Pos2> {
+  let unit: [f32; 3] = std::array::from_fn(|a| to_unit(v[a], ranges[a]));
+  let pos = cam.project(unit).0;
+  pos.is_finite().then_some(pos)
+}
+
+/// Title of an axis: its label, with " (log)" after it on a log axis. An empty label on a log
+/// axis gives just "(log)".
+fn axis_title(label: &str, log: bool) -> String {
+  match (log, label.is_empty()) {
+    (false, _) => label.to_owned(),
+    (true, true) => "(log)".to_owned(),
+    (true, false) => format!("{label} (log)"),
+  }
 }
 
 /// Spacing of `nice_ticks` over `min..=max`: 1, 2 or 5 times a power of ten, giving about
@@ -455,8 +538,16 @@ fn round_to(v: f64, digits: usize) -> f64 {
   (v * scale).round() / scale + 0.0
 }
 
-/// Labels and normalised positions of the ticks of an axis spanning `range`.
-fn axis_ticks(range: (f64, f64)) -> Vec<(String, f32)> {
+/// Labels and normalised positions of the ticks of an axis spanning `range`. On a log axis the
+/// range is in exponents, and the ticks are labelled with the values they stand for.
+fn axis_ticks(range: (f64, f64), log: bool) -> Vec<(String, f32)> {
+  if log {
+    return scale::log_ticks(range.0, range.1, LOG_TICKS)
+      .into_iter()
+      .map(|e| (scale::log_label(e), to_unit(e, range)))
+      .filter(|(_, pos)| pos.is_finite())
+      .collect();
+  }
   let digits = decimals(nice_step(range.0, range.1, TICKS));
   nice_ticks(range.0, range.1, TICKS)
     .into_iter()
@@ -548,8 +639,20 @@ fn legend_rows(
     .collect()
 }
 
-/// Draws `text` at `offset` points from `at`, away from `center`, anchored on the side facing away.
-fn annotate(
+/// Unit vector from `center` towards `at` on screen (up if they coincide).
+fn outward(center: egui::Pos2, at: egui::Pos2) -> egui::Vec2 {
+  let away = at - center;
+  let len = away.length();
+  if len > 1e-3 {
+    away / len
+  } else {
+    egui::vec2(0.0, -1.0)
+  }
+}
+
+/// Lays out `text` to go `offset` points from `at`, away from `center`, anchored on the side
+/// facing away. Returns the galley and the rect it will occupy.
+fn label_at(
   painter: &egui::Painter,
   center: egui::Pos2,
   at: egui::Pos2,
@@ -557,14 +660,8 @@ fn annotate(
   text: &str,
   font: &egui::FontId,
   color: egui::Color32,
-) {
-  let away = at - center;
-  let len = away.length();
-  let dir = if len > 1e-3 {
-    away / len
-  } else {
-    egui::vec2(0.0, -1.0)
-  };
+) -> (Arc<egui::Galley>, egui::Rect) {
+  let dir = outward(center, at);
   let side = |v: f32| {
     if v > 0.3 {
       egui::Align::Min
@@ -575,7 +672,15 @@ fn annotate(
     }
   };
   let anchor = egui::Align2([side(dir.x), side(dir.y)]);
-  painter.text(at + dir * offset, anchor, text, font.clone(), color);
+  let galley = painter.layout_no_wrap(text.to_owned(), font.clone(), color);
+  let rect = anchor.anchor_size(at + dir * offset, galley.size());
+  (galley, rect)
+}
+
+/// Extent of `size` along the unit direction `dir`, i.e. how far a label of that size reaches
+/// outwards from its anchor.
+fn extent_along(size: egui::Vec2, dir: egui::Vec2) -> f32 {
+  size.x * dir.x.abs() + size.y * dir.y.abs()
 }
 
 /// Draws the back panes with their grid, the edges of the back panes, and the tick labels and
@@ -585,13 +690,15 @@ fn draw_box(
   painter: &egui::Painter,
   cam: &Camera,
   ranges: [(f64, f64); 3],
+  log: [bool; 3],
   labels: [&str; 3],
 ) {
   let visuals = ui.visuals();
   let back = back_sides(cam.d);
   let front = back.map(|side| -side);
   let zedge = leftmost_vertical(cam);
-  let ticks: [Vec<(String, f32)>; 3] = std::array::from_fn(|a| axis_ticks(ranges[a]));
+  let ticks: [Vec<(String, f32)>; 3] = std::array::from_fn(|a| axis_ticks(ranges[a], log[a]));
+  let titles: [String; 3] = std::array::from_fn(|a| axis_title(labels[a], log[a]));
   let pos = |p: [f32; 3]| cam.project(p).0;
   let grid = egui::Stroke::new(0.5, visuals.widgets.noninteractive.bg_stroke.color);
 
@@ -623,14 +730,32 @@ fn draw_box(
   let small = egui::TextStyle::Small.resolve(ui.style());
   let body = egui::TextStyle::Body.resolve(ui.style());
   let color = visuals.text_color();
-  for (a, axis) in ticks.iter().enumerate() {
-    for (text, n) in axis {
+  // Where two axes end on the same box corner their end labels would print over each other, so
+  // a label that would overlap one already drawn is left out. Log axes go first, so that their
+  // decade labels win.
+  let mut taken: Vec<egui::Rect> = Vec::new();
+  let mut order = [0, 1, 2];
+  order.sort_by_key(|&a| !log[a]);
+  // How far each axis's tick labels reach outwards, so that its title clears them.
+  let mut reach = [0.0f32; 3];
+  for a in order {
+    for (text, n) in &ticks[a] {
       let at = pos(tick_edge(a, *n, front, zedge));
-      annotate(painter, center, at, TICK_OFFSET, text, &small, color);
+      let (galley, rect) = label_at(painter, center, at, TICK_OFFSET, text, &small, color);
+      reach[a] = reach[a].max(extent_along(galley.size(), outward(center, at)));
+      if taken.iter().any(|r| r.intersects(rect.shrink(1.0))) {
+        continue;
+      }
+      painter.galley(rect.min, galley, color);
+      taken.push(rect);
     }
-    if !labels[a].is_empty() {
+  }
+  for a in 0..3 {
+    if !titles[a].is_empty() {
       let at = pos(tick_edge(a, 0.0, front, zedge));
-      annotate(painter, center, at, TITLE_OFFSET, labels[a], &body, color);
+      let offset = TITLE_OFFSET.max(TICK_OFFSET + reach[a] + TITLE_GAP);
+      let (galley, rect) = label_at(painter, center, at, offset, &titles[a], &body, color);
+      painter.galley(rect.min, galley, color);
     }
   }
 }
@@ -898,12 +1023,12 @@ mod tests {
       points: false,
     }];
     let none = HashSet::new();
-    let r = data_ranges(&series, &none);
+    let r = data_ranges(&series, &none, [false; 3]);
     assert_eq!(r, [(1.0, 3.0), (1.5, 2.5), (4.5, 5.5)]);
 
     let hidden = HashSet::from(["a".to_owned()]);
-    assert_eq!(data_ranges(&series, &hidden), [(0.0, 1.0); 3]);
-    assert_eq!(data_ranges(&[], &none), [(0.0, 1.0); 3]);
+    assert_eq!(data_ranges(&series, &hidden, [false; 3]), [(0.0, 1.0); 3]);
+    assert_eq!(data_ranges(&[], &none, [false; 3]), [(0.0, 1.0); 3]);
   }
 
   #[test]
@@ -1263,5 +1388,236 @@ mod tests {
       drawn.marks,
       cols * rows
     );
+  }
+
+  fn near(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-9
+  }
+
+  #[test]
+  fn log_bounds_are_exponents_of_the_drawable_values() {
+    // z spans 1 to 1e6, and the zero is left out of the bounds.
+    let xy = vec![PlotPoint::new(1.0, 1.0); 4];
+    let z = [1.0, 1e3, 0.0, 1e6];
+    let series = [Series3d {
+      name: "a",
+      xy: &xy,
+      z: &z,
+      color: egui::Color32::RED,
+      lines: true,
+      points: false,
+    }];
+    let r = data_ranges(&series, &HashSet::new(), [false, false, true]);
+    assert!(near(r[2].0, 0.0) && near(r[2].1, 6.0), "{:?}", r[2]);
+
+    // A single value is widened by half a decade either way, as on a linear axis.
+    let z = [100.0; 4];
+    let series = [Series3d {
+      name: "a",
+      xy: &xy,
+      z: &z,
+      color: egui::Color32::RED,
+      lines: true,
+      points: false,
+    }];
+    let r = data_ranges(&series, &HashSet::new(), [false, false, true]);
+    assert!(near(r[2].0, 1.5) && near(r[2].1, 2.5), "{:?}", r[2]);
+  }
+
+  #[test]
+  fn log_axis_ticks_are_decades_labelled_as_values() {
+    let ticks = axis_ticks((0.0, 6.0), true);
+    let labels: Vec<&str> = ticks.iter().map(|(l, _)| l.as_str()).collect();
+    assert_eq!(labels, ["1", "10", "100", "1000", "1e4", "1e5", "1e6"]);
+    assert!(near(f64::from(ticks[0].1), -1.0));
+    assert!(near(f64::from(ticks[ticks.len() - 1].1), 1.0));
+
+    // A span within one decade gets the 1 to 9 subdivisions.
+    let narrow = axis_ticks((2f64.log10(), 8f64.log10()), true);
+    let labels: Vec<&str> = narrow.iter().map(|(l, _)| l.as_str()).collect();
+    assert_eq!(labels, ["2", "3", "4", "5", "6", "7", "8"]);
+
+    // Linear axes keep their round values.
+    let linear = axis_ticks((0.0, 1.0), false);
+    assert_eq!(linear.len(), 6);
+    assert_eq!(linear[0].0, "0.0");
+  }
+
+  #[test]
+  fn log_axis_titles_say_log() {
+    assert_eq!(axis_title("z", true), "z (log)");
+    assert_eq!(axis_title("", true), "(log)");
+    assert_eq!(axis_title("z", false), "z");
+    assert_eq!(axis_title("", false), "");
+  }
+
+  #[test]
+  fn dropped_counts_the_points_left_out_by_a_log_axis() {
+    let ctx = egui::Context::default();
+    let (xy, _) = ramp(5);
+    let z = [1.0, 0.0, 10.0, -2.0, 100.0];
+    let series = [Series3d {
+      name: "a",
+      xy: &xy,
+      z: &z,
+      color: egui::Color32::RED,
+      lines: false,
+      points: true,
+    }];
+    let mut view = View3d {
+      log: [false, false, true],
+      ..View3d::default()
+    };
+    let (drawn, _) = frame(&ctx, &mut view, &series, Vec::new());
+    assert_eq!((drawn.total, drawn.dropped), (5, 2));
+
+    // The point at x = 0 is left out when x is a log axis.
+    view.log = [true, false, false];
+    let (drawn, _) = frame(&ctx, &mut view, &series, Vec::new());
+    assert_eq!(drawn.dropped, 1);
+
+    view.log = [false; 3];
+    let (drawn, _) = frame(&ctx, &mut view, &series, Vec::new());
+    assert_eq!(drawn.dropped, 0);
+  }
+
+  #[test]
+  fn a_non_positive_point_splits_a_line_into_runs() {
+    let log = [false, false, true];
+    let (xy, _) = ramp(5);
+    let z = [1.0, 10.0, 0.0, 100.0, 1000.0];
+    let lens: Vec<usize> = line_runs(&xy, &z, log).iter().map(Vec::len).collect();
+    assert_eq!(lens, [2, 2]);
+    // Without a log axis nothing is left out.
+    assert_eq!(line_runs(&xy, &z, [false; 3]).len(), 1);
+
+    // A non-positive point at either end only shortens the line.
+    let (xy4, _) = ramp(4);
+    assert_eq!(line_runs(&xy4, &[0.0, 1.0, 10.0, 0.0], log).len(), 1);
+
+    // A point that is not finite is skipped, and the line goes on across it.
+    let (xy3, _) = ramp(3);
+    let runs = line_runs(&xy3, &[1.0, f64::NAN, 10.0], log);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].len(), 2);
+  }
+
+  #[test]
+  fn log_axes_with_nothing_drawable_draw_an_empty_box() {
+    let ctx = egui::Context::default();
+    let (xy, _) = ramp(10);
+    let z = [-1.0; 10];
+    let series = [Series3d {
+      name: "a",
+      xy: &xy,
+      z: &z,
+      color: egui::Color32::RED,
+      lines: true,
+      points: true,
+    }];
+    let mut view = View3d {
+      log: [true; 3],
+      ..View3d::default()
+    };
+    let (drawn, _) = frame(&ctx, &mut view, &series, Vec::new());
+    assert_eq!((drawn.marks, drawn.dropped), (0, 10));
+  }
+
+  #[test]
+  fn log_axes_draw_mixed_data_within_the_totals() {
+    let ctx = egui::Context::default();
+    let (lxy, lz) = lorenz(5000);
+    let mut rng = Rng(9);
+    let mut cxy: Vec<PlotPoint> = (0..20_000)
+      .map(|_| PlotPoint::new(rng.unit() * 2.0 - 1.0, rng.unit() * 2.0 - 1.0))
+      .collect();
+    let mut cz: Vec<f64> = (0..20_000).map(|_| rng.unit() * 2.0 - 1.0).collect();
+    // Not finite: skipped as before, and not counted as dropped.
+    cxy[0] = PlotPoint::new(f64::NAN, 0.5);
+    cz[1] = f64::INFINITY;
+    let series = [
+      Series3d {
+        name: "lorenz",
+        xy: &lxy,
+        z: &lz,
+        color: egui::Color32::from_rgb(90, 160, 220),
+        lines: true,
+        points: false,
+      },
+      Series3d {
+        name: "cloud",
+        xy: &cxy,
+        z: &cz,
+        color: egui::Color32::from_rgb(230, 120, 80),
+        lines: false,
+        points: true,
+      },
+    ];
+    let non_positive = |v: [f64; 3]| v.iter().any(|&c| c <= 0.0);
+    let expected: usize = lxy
+      .iter()
+      .zip(&lz)
+      .filter(|&(p, &z)| non_positive([p.x, p.y, z]))
+      .count()
+      + cxy
+        .iter()
+        .zip(&cz)
+        .filter(|&(p, &z)| non_positive([p.x, p.y, z]))
+        .count();
+
+    let mut view = View3d {
+      log: [true; 3],
+      ..View3d::default()
+    };
+    for perspective in [false, true] {
+      view.perspective = perspective;
+      let (drawn, _) = frame(&ctx, &mut view, &series, Vec::new());
+      assert_eq!(drawn.total, 25_000);
+      assert_eq!(drawn.dropped, expected);
+      assert!(
+        drawn.marks > 0 && drawn.marks <= drawn.total,
+        "{} marks",
+        drawn.marks
+      );
+    }
+  }
+
+  /// Renders a helix with a log z axis to the file named by `LOG3D_PNG`, or to the temp dir, for
+  /// a person to look at. Run with `cargo test log3d_snapshot -- --ignored --nocapture`.
+  #[test]
+  #[ignore = "renders a PNG for a person to look at"]
+  fn log3d_snapshot() {
+    // Three turns while z climbs from 1 to 1e6: the helix is evenly spaced on the log axis.
+    let t: Vec<f64> = (0..=240).map(|i| f64::from(i) / 20.0).collect();
+    let xy: Vec<PlotPoint> = t
+      .iter()
+      .map(|&t| {
+        let a = t * std::f64::consts::TAU / 4.0;
+        PlotPoint::new(a.cos(), a.sin())
+      })
+      .collect();
+    let z: Vec<f64> = t.iter().map(|&t| 10f64.powf(t / 2.0)).collect();
+    let series = [Series3d {
+      name: "helix",
+      xy: &xy,
+      z: &z,
+      color: egui::Color32::from_rgb(90, 160, 220),
+      lines: true,
+      points: false,
+    }];
+    let mut view = View3d {
+      log: [false, false, true],
+      ..View3d::default()
+    };
+    let img = crate::snapshot::snapshot(egui::vec2(900.0, 560.0), 2.0, 10, |ui| {
+      egui::CentralPanel::default().show(ui, |ui| {
+        view.show(ui, &series, ["x", "y", "z"]);
+      });
+    });
+    let path = std::env::var_os("LOG3D_PNG")
+      .map(std::path::PathBuf::from)
+      .unwrap_or_else(|| std::env::temp_dir().join("complot-log3d.png"));
+    img.write_png(&path).expect("PNG written");
+    println!("wrote {}", path.display());
   }
 }

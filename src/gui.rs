@@ -3,9 +3,14 @@
 use crate::hist::{self, BinRule, Histogram};
 use crate::lod::{decimate_line, decimate_points};
 use crate::model::{Geom, Kind, PlotState, Series};
+use crate::scale::{log_label, log_ticks, to_log};
 use crate::view3d::{Series3d, View3d};
 use eframe::egui;
-use egui_plot::{Bar, BarChart, Legend, Line, Plot, PlotPoint, PlotPoints, PlotUi, Points};
+use egui_plot::{
+  Bar, BarChart, GridInput, GridMark, HoverPosition, Legend, Line, Plot, PlotPoint, PlotPoints,
+  PlotUi, Points,
+};
+use std::collections::VecDeque;
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -95,11 +100,24 @@ enum HistLayout {
   Stack,
 }
 
-/// A histogram and the key it was computed for: data version, bin rule and series count.
+/// A histogram and the key it was computed for: data version, bin rule and series count. The
+/// values are binned in log10 if `log_x`.
 struct HistCache {
   key: (u64, BinRule, usize),
+  log_x: bool,
   /// `None` when there are no values.
   hist: Option<Histogram>,
+}
+
+/// The series with their points mapped to log10 on the log axes, and the points left out.
+struct LogCache {
+  /// Data version, log axes (x, y) and series count the cache was built for.
+  key: (u64, [bool; 2], usize),
+  series: Vec<Series>,
+  /// Per series, where a run of kept points starts after left-out points; see `log_series`.
+  starts: Vec<Vec<usize>>,
+  /// Points left out because a coordinate has no place on a log axis.
+  dropped: usize,
 }
 
 /// Settings and view state of one window. Settings live in memory only.
@@ -129,6 +147,12 @@ struct PlotApp {
   hist_layout: HistLayout,
   /// The histogram of the data, shared by the status line and the plot.
   hist_cache: Option<HistCache>,
+  /// Log scale of the x, y and z axes.
+  log: [bool; 3],
+  /// The series mapped to log10, shared by the x–y plot and the histogram.
+  log_cache: Option<LogCache>,
+  /// Points left out for a value ≤ 0 on a log axis, as of the last frame.
+  dropped: usize,
   /// Camera and display state of the 3D view.
   view3d: View3d,
 }
@@ -260,22 +284,113 @@ fn toggle_button(
   response.rect
 }
 
-/// Histogram of the series in `st`, from `cache` if its key still matches. The points must be
-/// contiguous, as [`lock_contiguous`] makes them.
+/// Histogram of `series`, the series of `st` mapped to log10 if `log_x`, from `cache` if its key
+/// still matches. The points must be contiguous, as [`lock_contiguous`] and [`log_series`] make them.
 fn cached_histogram<'a>(
   cache: &'a mut Option<HistCache>,
   rule: BinRule,
+  log_x: bool,
   st: &PlotState,
+  series: &[Series],
 ) -> Option<&'a Histogram> {
   let key = (st.version, rule, st.series.len());
-  if cache.as_ref().is_none_or(|c| c.key != key) {
-    let slices: Vec<&[PlotPoint]> = st.series.iter().map(|s| s.points.as_slices().0).collect();
+  if cache
+    .as_ref()
+    .is_none_or(|c| c.key != key || c.log_x != log_x)
+  {
+    let slices: Vec<&[PlotPoint]> = series.iter().map(|s| s.points.as_slices().0).collect();
     *cache = Some(HistCache {
       key,
+      log_x,
       hist: hist::histogram(&slices, rule),
     });
   }
   cache.as_ref()?.hist.as_ref()
+}
+
+/// The series to draw or bin, with their points mapped to log10 on the axes `logs` (x, y). With
+/// no log axis these are the series of `st` themselves. Otherwise they come from `cache`, rebuilt
+/// when the data, the axes or the series count change. Also returns where runs of kept points
+/// start (empty with no log axis) and the number of points left out.
+fn mapped_series<'a>(
+  cache: &'a mut Option<LogCache>,
+  st: &'a PlotState,
+  logs: [bool; 2],
+) -> (&'a [Series], &'a [Vec<usize>], usize) {
+  if logs == [false; 2] {
+    *cache = None;
+    return (&st.series, &[], 0);
+  }
+  let key = (st.version, logs, st.series.len());
+  if cache.as_ref().is_none_or(|c| c.key != key) {
+    let (series, starts, dropped) = log_series(&st.series, logs);
+    *cache = Some(LogCache {
+      key,
+      series,
+      starts,
+      dropped,
+    });
+  }
+  // The cache was filled above when it did not match.
+  let c = cache.as_ref().expect("the cache was filled above");
+  (&c.series, &c.starts, c.dropped)
+}
+
+/// Copies of `series` with their points mapped to log10 on the axes `logs` (x, y). A point with
+/// a coordinate that has no place on a log axis is left out. Also returns, per series, the
+/// indices of the mapped points that start a new run because points were left out just before
+/// them (a line must not bridge that gap), and how many points were left out in all.
+/// Log is monotonic, so the mapped series keep their order and their `sorted` flag.
+fn log_series(series: &[Series], logs: [bool; 2]) -> (Vec<Series>, Vec<Vec<usize>>, usize) {
+  let mut dropped = 0;
+  let (mapped, starts) = series
+    .iter()
+    .map(|s| {
+      let mut points = VecDeque::with_capacity(s.points.len());
+      let mut starts = Vec::new();
+      let mut gap = false;
+      for p in &s.points {
+        let x = if logs[0] { to_log(p.x) } else { Some(p.x) };
+        let y = if logs[1] { to_log(p.y) } else { Some(p.y) };
+        match x.zip(y) {
+          Some((x, y)) => {
+            if gap && !points.is_empty() {
+              starts.push(points.len());
+            }
+            gap = false;
+            points.push_back(PlotPoint::new(x, y));
+          }
+          None => {
+            dropped += 1;
+            gap = true;
+          }
+        }
+      }
+      points.make_contiguous();
+      let series = Series {
+        name: s.name.clone(),
+        points,
+        sorted: s.sorted,
+        ..Default::default()
+      };
+      (series, starts)
+    })
+    .unzip();
+  (mapped, starts, dropped)
+}
+
+/// `points` split at `starts` (ascending indices where a run begins) into runs.
+fn runs<'a>(points: &'a [PlotPoint], starts: &[usize]) -> impl Iterator<Item = &'a [PlotPoint]> {
+  let bounds: Vec<usize> = std::iter::once(0)
+    .chain(
+      starts
+        .iter()
+        .copied()
+        .filter(|&i| i > 0 && i < points.len()),
+    )
+    .chain(std::iter::once(points.len()))
+    .collect();
+  (0..bounds.len() - 1).map(move |k| &points[bounds[k]..bounds[k + 1]])
 }
 
 /// Bars of group `group` of `groups` in each bin of `h`, as (argument, width, height).
@@ -303,24 +418,74 @@ fn bar_layout(
     .collect()
 }
 
-/// One bar chart per series, in series order. In a stack, each chart sits on the ones before it.
-fn bar_charts(h: &Histogram, layout: HistLayout, series: &[Series]) -> Vec<BarChart> {
+/// Bars of group `group` of `groups` when the counts are on a log axis, as (argument, width,
+/// base, height). A count c ≥ 1 rises from zero to log10(c), and a count of 0 draws no bar, so it
+/// is left out. Stacked, log heights do not add up: the bar of group g spans log10 of the
+/// cumulative counts of the groups before it (zero below the first) up to log10 of those with g.
+/// Arguments and widths are those of [`bar_layout`].
+fn log_bars(
+  h: &Histogram,
+  layout: HistLayout,
+  group: usize,
+  groups: usize,
+) -> Vec<(f64, f64, f64, f64)> {
+  bar_layout(h, layout, group, groups)
+    .into_iter()
+    .enumerate()
+    .filter_map(|(b, (arg, width, _))| {
+      let count = h.counts[group][b];
+      if count == 0 {
+        return None;
+      }
+      let (base, top) = match layout {
+        HistLayout::Side => (0.0, (count as f64).log10()),
+        HistLayout::Stack => {
+          let below: u64 = h.counts[..group].iter().map(|c| c[b]).sum();
+          let base = if below == 0 {
+            0.0
+          } else {
+            (below as f64).log10()
+          };
+          (base, ((below + count) as f64).log10())
+        }
+      };
+      Some((arg, width, base, top - base))
+    })
+    .collect()
+}
+
+/// One bar chart per series, in series order. In a stack, each chart sits on the ones before it,
+/// unless the counts are on a log axis: then each bar is placed by [`log_bars`].
+fn bar_charts(h: &Histogram, layout: HistLayout, series: &[Series], log_y: bool) -> Vec<BarChart> {
   let mut charts: Vec<BarChart> = Vec::with_capacity(series.len());
   for (g, s) in series.iter().enumerate() {
     let color = palette(g);
     // egui_plot's default fill is 20% opaque, too faint to tell stacked bars apart.
     let (fill, stroke) = (color.gamma_multiply(0.6), egui::Stroke::new(1.0, color));
-    let bars: Vec<Bar> = bar_layout(h, layout, g, series.len())
-      .into_iter()
-      .map(|(arg, width, height)| Bar::new(arg, height).width(width).fill(fill).stroke(stroke))
-      .collect();
+    let bars: Vec<Bar> = if log_y {
+      log_bars(h, layout, g, series.len())
+        .into_iter()
+        .map(|(arg, width, base, height)| {
+          Bar::new(arg, height)
+            .base_offset(base)
+            .width(width)
+            .fill(fill)
+            .stroke(stroke)
+        })
+        .collect()
+    } else {
+      bar_layout(h, layout, g, series.len())
+        .into_iter()
+        .map(|(arg, width, height)| Bar::new(arg, height).width(width).fill(fill).stroke(stroke))
+        .collect()
+    };
     let chart = BarChart::new(s.name.as_str(), bars).color(color);
     let chart = match layout {
-      HistLayout::Side => chart,
-      HistLayout::Stack => {
+      HistLayout::Stack if !log_y => {
         let below: Vec<&BarChart> = charts.iter().collect();
         chart.stack_on(&below)
       }
+      _ => chart,
     };
     charts.push(chart);
   }
@@ -349,6 +514,84 @@ fn paint_waiting(ui: &egui::Ui, rect: egui::Rect, name: &str) {
   );
 }
 
+/// Grid marks of a log axis over `bounds`, which are exponents. Whole decades get step 1 and the
+/// subdivisions 0.1, so that egui_plot draws the decades stronger.
+fn log_grid(input: GridInput) -> Vec<GridMark> {
+  log_ticks(input.bounds.0, input.bounds.1, 10)
+    .into_iter()
+    .map(|value| {
+      let decade = (value - value.round()).abs() < 1e-9;
+      GridMark {
+        value,
+        step_size: if decade { 1.0 } else { 0.1 },
+      }
+    })
+    .collect()
+}
+
+/// Label of a log axis at `mark`: the value 10^`mark.value`.
+fn log_axis_label(mark: GridMark, _range: &RangeInclusive<f64>) -> String {
+  log_label(mark.value)
+}
+
+/// Axis title, with " (log)" after the label on a log axis. A linear axis without a label stays
+/// without one.
+fn axis_title(label: &str, log: bool) -> String {
+  match (label.is_empty(), log) {
+    (_, false) => label.to_string(),
+    (true, true) => "(log)".to_string(),
+    (false, true) => format!("{label} (log)"),
+  }
+}
+
+/// Hover text of a point: its series, then its values before the log axes, 10^v on a log axis.
+fn hover_text(pos: &HoverPosition<'_>, logs: [bool; 2]) -> String {
+  let value = |v: f64, log: bool| sig4(if log { 10f64.powf(v) } else { v });
+  match pos {
+    HoverPosition::NearDataPoint {
+      plot_name,
+      position,
+      ..
+    } => format!(
+      "{plot_name}\nx = {}\ny = {}",
+      value(position.x, logs[0]),
+      value(position.y, logs[1])
+    ),
+    HoverPosition::Elsewhere { position } => format!(
+      "x = {}\ny = {}",
+      value(position.x, logs[0]),
+      value(position.y, logs[1])
+    ),
+  }
+}
+
+/// `v` with at most four significant digits: plain from 1e-4 to below 1e4, else scientific.
+fn sig4(v: f64) -> String {
+  if !v.is_finite() || v == 0.0 {
+    return v.to_string();
+  }
+  let magnitude = v.abs().log10().floor() as i32;
+  if (-4..4).contains(&magnitude) {
+    let decimals = (3 - magnitude) as usize;
+    trim_fraction(&format!("{v:.decimals$}")).to_string()
+  } else {
+    let scientific = format!("{v:.3e}");
+    match scientific.split_once('e') {
+      Some((mantissa, exponent)) => format!("{}e{exponent}", trim_fraction(mantissa)),
+      None => scientific,
+    }
+  }
+}
+
+/// Drops the trailing zeros of a decimal fraction, and the point too if nothing follows it.
+fn trim_fraction(s: &str) -> &str {
+  if s.contains('.') {
+    s.trim_end_matches('0').trim_end_matches('.')
+  } else {
+    s
+  }
+}
+
 impl PlotApp {
   fn new(name: &str, state: Arc<Mutex<PlotState>>) -> Self {
     let max_points = lock(&state).max_points;
@@ -370,6 +613,9 @@ impl PlotApp {
       bin_rule: BinRule::default(),
       hist_layout: HistLayout::Side,
       hist_cache: None,
+      log: [false; 3],
+      log_cache: None,
+      dropped: 0,
       view3d: View3d::default(),
     }
   }
@@ -437,6 +683,7 @@ impl PlotApp {
   /// The settings groups and the status line. Which groups show depends on the kind of plot.
   fn settings_groups(&mut self, ui: &mut egui::Ui) {
     let kind = self.kind_group(ui);
+    self.scale_group(ui, kind);
     let bins = if kind == Kind::Hist {
       self.hist_bins()
     } else {
@@ -507,6 +754,9 @@ impl PlotApp {
     if kind == Kind::Hist {
       status = format!("{status} · {bins} bins");
     }
+    if self.dropped > 0 {
+      status = format!("{status} · {} ≤ 0 hidden", self.dropped);
+    }
     ui.label(status);
   }
 
@@ -535,6 +785,28 @@ impl PlotApp {
       st.version += 1;
     }
     chosen
+  }
+
+  /// The "Scale" group: which axes are logarithmic, and z in 3D only. Toggling an axis refits the
+  /// view, whose bounds are in the other scale.
+  fn scale_group(&mut self, ui: &mut egui::Ui, kind: Kind) {
+    let before = self.log;
+    ui.group(|ui| {
+      ui.label(egui::RichText::new("Scale").strong());
+      if kind == Kind::Hist {
+        ui.checkbox(&mut self.log[0], "log x (values)");
+        ui.checkbox(&mut self.log[1], "log y (counts)");
+      } else {
+        ui.checkbox(&mut self.log[0], "log x");
+        ui.checkbox(&mut self.log[1], "log y");
+      }
+      if kind == Kind::ThreeD {
+        ui.checkbox(&mut self.log[2], "log z");
+      }
+    });
+    if self.log != before {
+      self.fit_request = true;
+    }
   }
 
   /// The "All series" group: the geometry of every series without its own, and the marker
@@ -669,11 +941,20 @@ impl PlotApp {
     });
   }
 
-  /// Number of bins of the histogram of the data, 0 with no values. Refreshes the cache.
+  /// Number of bins of the histogram of the data, 0 with no values. Refreshes the caches.
   fn hist_bins(&mut self) -> usize {
     let state = Arc::clone(&self.state);
     let st = lock_contiguous(&state);
-    cached_histogram(&mut self.hist_cache, self.bin_rule, &st).map_or(0, Histogram::bins)
+    // The values are the y of the data, so the mapping of the histogram is on y.
+    let (series, _, _) = mapped_series(&mut self.log_cache, &st, [false, self.log[0]]);
+    cached_histogram(
+      &mut self.hist_cache,
+      self.bin_rule,
+      self.log[0],
+      &st,
+      series,
+    )
+    .map_or(0, Histogram::bins)
   }
 
   /// The central view, of the plot's kind.
@@ -692,25 +973,41 @@ impl PlotApp {
     }
   }
 
-  /// The x–y plot, each series with its own geometry.
+  /// The x–y plot, each series with its own geometry. On a log axis the values are drawn in log10.
   fn xy_plot(&mut self, ui: &mut egui::Ui, st: &PlotState, request: Option<bool>) {
     let (radius, width) = (self.point_radius, self.line_width);
     let (legend, grid) = (self.legend, self.grid);
+    let [log_x, log_y, _] = self.log;
+    let (series, starts, dropped) = mapped_series(&mut self.log_cache, st, [log_x, log_y]);
     let name = &self.name;
     let total = st.total_points();
     let mut follow: Option<bool> = None;
     let mut decimated: Option<(usize, usize)> = None;
 
     egui::CentralPanel::default().show(ui, |ui| {
-      let mut plot = Plot::new("complot_plot").show_grid(grid);
+      let mut plot = Plot::new("complot_plot")
+        .show_grid(grid)
+        .label_formatter(move |pos| Some(hover_text(pos, [log_x, log_y])));
       if legend {
         plot = plot.legend(Legend::default());
       }
-      if !st.x_label.is_empty() {
-        plot = plot.x_axis_label(st.x_label.as_str());
+      if log_x {
+        plot = plot
+          .x_grid_spacer(log_grid)
+          .x_axis_formatter(log_axis_label);
       }
-      if !st.y_label.is_empty() {
-        plot = plot.y_axis_label(st.y_label.as_str());
+      if log_y {
+        plot = plot
+          .y_grid_spacer(log_grid)
+          .y_axis_formatter(log_axis_label);
+      }
+      let x_title = axis_title(&st.x_label, log_x);
+      if !x_title.is_empty() {
+        plot = plot.x_axis_label(x_title);
+      }
+      let y_title = axis_title(&st.y_label, log_y);
+      if !y_title.is_empty() {
+        plot = plot.y_axis_label(y_title);
       }
 
       let response = plot.show(ui, |plot_ui| {
@@ -735,26 +1032,33 @@ impl PlotApp {
         let as_points = |s: &Series| has_points(st.geom_of(&s.name)) || !as_line(s);
 
         // Per series, the marks drawn for it (line points or markers, whichever more).
-        let mut marks = vec![0; st.series.len()];
+        let mut marks = vec![0; series.len()];
         let mut any_decimated = false;
         // Lines first, so that the points of every series are drawn on top.
         // A line and the points of a series share a name and an id (the
         // default), so the legend shows one entry for both.
-        for (i, s) in st.series.iter().enumerate().filter(|(_, s)| as_line(s)) {
+        // On a log axis, points with no place on it split a line into runs, drawn as separate
+        // lines (same name, so still one legend entry) so that no line bridges the gap.
+        for (i, s) in series.iter().enumerate().filter(|(_, s)| as_line(s)) {
           let pts = s.points.as_slices().0;
-          let line = if big(s) {
-            let [x0, x1, _, _] = decimation_range(pts, s.sorted, auto, min, max);
-            let kept = decimate_line(pts, x0, x1, columns);
-            any_decimated = true;
-            marks[i] = kept.len();
-            Line::new(s.name.as_str(), PlotPoints::Owned(kept))
-          } else {
-            marks[i] = pts.len();
-            Line::new(s.name.as_str(), PlotPoints::Borrowed(pts))
-          };
-          plot_ui.line(line.color(palette(i)).width(width));
+          let range = big(s).then(|| decimation_range(pts, s.sorted, auto, min, max));
+          for run in runs(pts, starts.get(i).map_or(&[], Vec::as_slice)) {
+            let line = match range {
+              Some([x0, x1, _, _]) => {
+                let kept = decimate_line(run, x0, x1, columns);
+                any_decimated = true;
+                marks[i] += kept.len();
+                Line::new(s.name.as_str(), PlotPoints::Owned(kept))
+              }
+              None => {
+                marks[i] += run.len();
+                Line::new(s.name.as_str(), PlotPoints::Borrowed(run))
+              }
+            };
+            plot_ui.line(line.color(palette(i)).width(width));
+          }
         }
-        for (i, s) in st.series.iter().enumerate().filter(|(_, s)| as_points(s)) {
+        for (i, s) in series.iter().enumerate().filter(|(_, s)| as_points(s)) {
           let pts = s.points.as_slices().0;
           let points = if big(s) {
             let [x0, x1, y0, y1] = decimation_range(pts, s.sorted, auto, min, max);
@@ -785,13 +1089,18 @@ impl PlotApp {
       self.follow = on;
     }
     self.set_decimated(ui, decimated);
+    self.set_dropped(ui, dropped);
   }
 
-  /// The histogram: one bar chart per series, over bins shared by all of them.
+  /// The histogram: one bar chart per series, over bins shared by all of them. Log values are
+  /// binned in log10, and log counts are drawn as log10 heights.
   fn hist_plot(&mut self, ui: &mut egui::Ui, st: &PlotState, request: Option<bool>) {
+    let [log_x, log_y, _] = self.log;
     let layout = self.hist_layout;
-    let charts = match cached_histogram(&mut self.hist_cache, self.bin_rule, st) {
-      Some(h) => bar_charts(h, layout, &st.series),
+    // The values are the y of the data, so the mapping of the histogram is on y.
+    let (series, _, dropped) = mapped_series(&mut self.log_cache, st, [false, log_x]);
+    let charts = match cached_histogram(&mut self.hist_cache, self.bin_rule, log_x, st, series) {
+      Some(h) => bar_charts(h, layout, &st.series, log_y),
       None => Vec::new(),
     };
     let (legend, grid) = (self.legend, self.grid);
@@ -802,13 +1111,26 @@ impl PlotApp {
     } else {
       st.y_label.as_str()
     };
+    let x_title = axis_title(x_label, log_x);
+    let y_title = axis_title("count", log_y);
     let mut follow: Option<bool> = None;
 
     egui::CentralPanel::default().show(ui, |ui| {
       let mut plot = Plot::new("complot_hist")
         .show_grid(grid)
-        .x_axis_label(x_label)
-        .y_axis_label("count");
+        .x_axis_label(x_title)
+        .y_axis_label(y_title)
+        .label_formatter(move |pos| Some(hover_text(pos, [log_x, log_y])));
+      if log_x {
+        plot = plot
+          .x_grid_spacer(log_grid)
+          .x_axis_formatter(log_axis_label);
+      }
+      if log_y {
+        plot = plot
+          .y_grid_spacer(log_grid)
+          .y_axis_formatter(log_axis_label);
+      }
       if legend {
         plot = plot.legend(Legend::default());
       }
@@ -828,6 +1150,7 @@ impl PlotApp {
       self.follow = on;
     }
     self.set_decimated(ui, None);
+    self.set_dropped(ui, dropped);
   }
 
   /// The 3D view of the series that have z values. Each series is drawn with its geometry.
@@ -835,6 +1158,7 @@ impl PlotApp {
     self.view3d.point_radius = self.point_radius;
     self.view3d.line_width = self.line_width;
     self.view3d.legend = self.legend;
+    self.view3d.log = self.log;
     let series: Vec<Series3d<'_>> = st
       .series
       .iter()
@@ -859,17 +1183,20 @@ impl PlotApp {
     ];
     let empty = st.total_points() == 0;
     let mut decimated: Option<(usize, usize)> = None;
+    let mut dropped = 0;
 
     egui::CentralPanel::default().show(ui, |ui| {
       let drawn = self.view3d.show(ui, &series, labels);
       if drawn.marks < drawn.total {
         decimated = Some((drawn.marks, drawn.total));
       }
+      dropped = drawn.dropped;
       if empty {
         paint_waiting(ui, drawn.response.rect, &self.name);
       }
     });
     self.set_decimated(ui, decimated);
+    self.set_dropped(ui, dropped);
   }
 
   /// Stores the decimation status for the settings of the next frame. The settings of this frame
@@ -879,6 +1206,15 @@ impl PlotApp {
       ui.ctx().request_repaint();
     }
     self.decimated = decimated;
+  }
+
+  /// Stores the points left out for a log axis, for the status line of the next frame. As with
+  /// [`Self::set_decimated`], a changed count asks for another frame.
+  fn set_dropped(&mut self, ui: &egui::Ui, dropped: usize) {
+    if self.dropped != dropped {
+      ui.ctx().request_repaint();
+    }
+    self.dropped = dropped;
   }
 }
 
@@ -911,6 +1247,10 @@ mod tests {
 
   /// Size of the screen the panel is drawn in.
   const SCREEN: egui::Vec2 = egui::vec2(900.0, 560.0);
+
+  /// A screen tall enough for the status line, which lies below the settings groups at the
+  /// default height.
+  const TALL: egui::Vec2 = egui::vec2(900.0, 760.0);
 
   /// Too long for the header, which must be shortened rather than overflow.
   const LONG_NAME: &str = "a_plot_name_much_too_long_for_the_settings_header";
@@ -1009,7 +1349,17 @@ mod tests {
     app: &mut PlotApp,
     events: Vec<egui::Event>,
   ) -> egui::FullOutput {
-    let mut output = ctx.run_ui(raw_input(ctx, SCREEN, events), |ui| app.draw(ui));
+    whole_frame_in(ctx, app, events, SCREEN)
+  }
+
+  /// Like [`whole_frame`], on a screen of the given size.
+  fn whole_frame_in(
+    ctx: &egui::Context,
+    app: &mut PlotApp,
+    events: Vec<egui::Event>,
+    screen: egui::Vec2,
+  ) -> egui::FullOutput {
+    let mut output = ctx.run_ui(raw_input(ctx, screen, events), |ui| app.draw(ui));
     // No renderer here, so the texture uploads are dropped unused.
     output.textures_delta.clear();
     output
@@ -1113,11 +1463,24 @@ mod tests {
     );
   }
 
-  /// Widest values: the largest slider values and the largest buffer limit.
+  /// Widest values: the largest slider values, the largest buffer limit and every axis on a
+  /// log scale, so that the Scale group is drawn in full.
   fn widest(app: &mut PlotApp) {
     app.point_radius = 10.0;
     app.line_width = 8.0;
     app.max_points = usize::MAX;
+    app.log = [true; 3];
+  }
+
+  /// Asserts that bars match `want`, each as (argument, width, base, height), up to `EPS`.
+  fn assert_bars(got: &[(f64, f64, f64, f64)], want: &[(f64, f64, f64, f64)]) {
+    assert_eq!(got.len(), want.len(), "{got:?} is not {want:?}");
+    for (g, w) in got.iter().zip(want) {
+      let close = [g.0 - w.0, g.1 - w.1, g.2 - w.2, g.3 - w.3]
+        .iter()
+        .all(|d| d.abs() < EPS);
+      assert!(close, "{g:?} is not {w:?}");
+    }
   }
 
   /// Points of the Lorenz attractor as (x, y, z), from RK4 steps of 0.01.
@@ -1358,9 +1721,9 @@ mod tests {
     });
     for layout in [HistLayout::Side, HistLayout::Stack] {
       app.hist_layout = layout;
-      let mut out = whole_frame(&ctx, &mut app, Vec::new());
+      let mut out = whole_frame_in(&ctx, &mut app, Vec::new(), TALL);
       for _ in 0..2 {
-        out = whole_frame(&ctx, &mut app, Vec::new());
+        out = whole_frame_in(&ctx, &mut app, Vec::new(), TALL);
       }
       // 100 values: Sturges gives 8 bins, which the status line and the group both show.
       let cache = app.hist_cache.as_ref().expect("the histogram is cached");
@@ -1460,6 +1823,292 @@ mod tests {
   }
 
   #[test]
+  fn log_series_drops_points_without_a_log_place() {
+    let mut st = PlotState::new();
+    // Not sorted in x: the zero comes after the 1.
+    for (x, y) in [
+      (1.0, 10.0),
+      (0.0, 5.0),
+      (10.0, -1.0),
+      (100.0, 1000.0),
+      (1000.0, 0.5),
+    ] {
+      st.push_point("a", Some(x), y, None).unwrap();
+    }
+    // Sorted in x, with the same values but no zero.
+    for (x, y) in [(1.0, 10.0), (10.0, -1.0), (100.0, 100.0), (1000.0, 0.5)] {
+      st.push_point("b", Some(x), y, None).unwrap();
+    }
+    let (mapped, starts, dropped) = log_series(&st.series, [true, true]);
+    assert_eq!(dropped, 3);
+    assert_eq!(mapped[0].sorted, st.series[0].sorted);
+    assert_eq!(mapped[1].sorted, st.series[1].sorted);
+    let points = |s: &Series| s.points.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>();
+    let close = |got: &[(f64, f64)], want: &[(f64, f64)]| {
+      got.len() == want.len()
+        && got
+          .iter()
+          .zip(want)
+          .all(|(g, w)| (g.0 - w.0).abs() < EPS && (g.1 - w.1).abs() < EPS)
+    };
+    let a = points(&mapped[0]);
+    assert!(
+      close(&a, &[(0.0, 1.0), (2.0, 3.0), (3.0, 0.5f64.log10())]),
+      "{a:?}"
+    );
+    let b = points(&mapped[1]);
+    assert!(
+      close(&b, &[(0.0, 1.0), (2.0, 2.0), (3.0, 0.5f64.log10())]),
+      "{b:?}"
+    );
+    assert!(
+      b.windows(2).all(|w| w[0].0 <= w[1].0),
+      "{b:?} is not sorted"
+    );
+    // In b the second point was left out, so a new run starts at the second mapped point.
+    assert_eq!(starts[1], vec![1]);
+  }
+
+  #[test]
+  fn runs_split_at_the_starts() {
+    let pts: Vec<PlotPoint> = (0..6).map(|i| PlotPoint::new(i as f64, 1.0)).collect();
+    let lens = |starts: &[usize]| {
+      runs(&pts, starts)
+        .map(<[PlotPoint]>::len)
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(lens(&[]), [6]);
+    assert_eq!(lens(&[2, 5]), [2, 3, 1]);
+    // Out-of-range or leading starts don't make empty runs.
+    assert_eq!(lens(&[0, 6, 9]), [6]);
+    // Leading and trailing gaps make no run start: [_, a, b, _, c] keeps [a, b] and [c].
+    let mut st = PlotState::new();
+    for (x, y) in [
+      (1.0, -1.0),
+      (2.0, 1.0),
+      (3.0, 2.0),
+      (4.0, 0.0),
+      (5.0, 3.0),
+      (6.0, -2.0),
+    ] {
+      st.push_point("s", Some(x), y, None).unwrap();
+    }
+    let (mapped, starts, dropped) = log_series(&st.series, [false, true]);
+    assert_eq!((dropped, starts[0].clone()), (3, vec![2]));
+    let lens: Vec<usize> = runs(mapped[0].points.as_slices().0, &starts[0])
+      .map(<[PlotPoint]>::len)
+      .collect();
+    assert_eq!(lens, [2, 1]);
+  }
+
+  #[test]
+  fn mapped_series_is_reused_until_the_data_or_the_axes_change() {
+    let mut st = PlotState::new();
+    st.push_point("a", Some(1.0), 1.0, None).unwrap();
+    st.push_point("a", Some(0.0), 1.0, None).unwrap();
+    let mut cache = None;
+    let (_, _, dropped) = mapped_series(&mut cache, &st, [true, false]);
+    assert_eq!(dropped, 1);
+    // Marks the cache. Nothing has changed, so the next call must return it as it is.
+    cache.as_mut().expect("the cache is kept").dropped = 99;
+    let (_, _, dropped) = mapped_series(&mut cache, &st, [true, false]);
+    assert_eq!(dropped, 99, "rebuilt although nothing changed");
+    // A new point changes the version, so the cache is rebuilt.
+    st.push_point("a", Some(4.0), 1.0, None).unwrap();
+    let (series, _, dropped) = mapped_series(&mut cache, &st, [true, false]);
+    assert_eq!(dropped, 1);
+    assert_eq!(series[0].points.len(), 2);
+    // Other log axes: rebuilt too.
+    cache.as_mut().expect("the cache is kept").dropped = 99;
+    let (_, _, dropped) = mapped_series(&mut cache, &st, [true, true]);
+    assert_eq!(dropped, 1);
+    // No log axis: the series as they are, and the cache is released.
+    let (series, _, dropped) = mapped_series(&mut cache, &st, [false, false]);
+    assert_eq!((dropped, series[0].points.len()), (0, 3));
+    assert!(cache.is_none());
+  }
+
+  #[test]
+  fn log_grid_draws_decades_stronger_than_subdivisions() {
+    let grid = |lo: f64, hi: f64| {
+      log_grid(GridInput {
+        bounds: (lo, hi),
+        base_step_size: 1.0,
+      })
+    };
+    // About three decades: whole decades only, all with the strong step.
+    let wide = grid(-0.3, 3.2);
+    let values: Vec<f64> = wide.iter().map(|m| m.value).collect();
+    assert_eq!(values, [0.0, 1.0, 2.0, 3.0]);
+    assert!(wide.iter().all(|m| m.step_size == 1.0));
+    // 1 to 100: 1, 2, 5, 10, 20 and 50, of which 1 and 10 are decades.
+    let narrow = grid(0.0, 1.99);
+    assert_eq!(narrow.len(), 6);
+    let decades: Vec<f64> = narrow
+      .iter()
+      .filter(|m| m.step_size == 1.0)
+      .map(|m| m.value)
+      .collect();
+    assert_eq!(decades, [0.0, 1.0]);
+    assert_eq!(narrow.iter().filter(|m| m.step_size < 1.0).count(), 4);
+  }
+
+  #[test]
+  fn log_bars_stack_on_cumulative_counts() {
+    // Group 0 is empty in bin 0 and group 1 in bin 1. Bin 2 holds 4 values in each group.
+    let h = Histogram {
+      start: 0.0,
+      width: 1.0,
+      counts: vec![vec![0, 1, 4, 0], vec![5, 0, 4, 3]],
+    };
+    // Group 0 rises from zero to log 1 in bin 1 and to log 4 in bin 2. Bin 0 is left out.
+    assert_bars(
+      &log_bars(&h, HistLayout::Stack, 0, 2),
+      &[(1.5, 0.9, 0.0, 0.0), (2.5, 0.9, 0.0, 4f64.log10())],
+    );
+    // Group 1 rises from zero to log 5 in bin 0. In bin 2 it sits on log 4 and reaches log 8,
+    // and in bin 3 it rises from zero to log 3. Bin 1 is left out.
+    assert_bars(
+      &log_bars(&h, HistLayout::Stack, 1, 2),
+      &[
+        (0.5, 0.9, 0.0, 5f64.log10()),
+        (2.5, 0.9, 4f64.log10(), 2f64.log10()),
+        (3.5, 0.9, 0.0, 3f64.log10()),
+      ],
+    );
+  }
+
+  #[test]
+  fn log_bars_side_rise_to_the_log_of_each_count() {
+    let h = Histogram {
+      start: 0.0,
+      width: 1.0,
+      counts: vec![vec![0, 1, 10], vec![3, 0, 100]],
+    };
+    // Two groups: bars 0.45 wide, the first at 0.05 + 0.5 * 0.45 into the bin, the second at
+    // 0.05 + 1.5 * 0.45.
+    assert_bars(
+      &log_bars(&h, HistLayout::Side, 0, 2),
+      &[(1.275, 0.45, 0.0, 0.0), (2.275, 0.45, 0.0, 1.0)],
+    );
+    assert_bars(
+      &log_bars(&h, HistLayout::Side, 1, 2),
+      &[(0.725, 0.45, 0.0, 3f64.log10()), (2.725, 0.45, 0.0, 2.0)],
+    );
+  }
+
+  #[test]
+  fn log_frames_run_in_every_kind() {
+    for plot_type in [PlotType::Both, PlotType::Hist, PlotType::Points3d] {
+      let (ctx, mut app) = app_with(|st| {
+        for i in 0..40 {
+          let t = i as f64;
+          // Values <= 0 on every axis; z is there for the 3D plot.
+          st.push_point("a", Some(t - 5.0), t - 3.0, Some(t - 7.0))
+            .unwrap();
+        }
+        st.set_type(plot_type, None).unwrap();
+      });
+      app.log = [true; 3];
+      for _ in 0..3 {
+        whole_frame(&ctx, &mut app, Vec::new());
+      }
+    }
+  }
+
+  #[test]
+  fn log_frames_count_the_points_left_out_in_the_status() {
+    // Runs a few frames, so that the status shows the points left out by the last one. The
+    // frames are tall enough for the status line to be drawn.
+    let run = |ctx: &egui::Context, app: &mut PlotApp| {
+      let mut out = whole_frame_in(ctx, app, Vec::new(), TALL);
+      for _ in 0..2 {
+        out = whole_frame_in(ctx, app, Vec::new(), TALL);
+      }
+      out
+    };
+    let shows =
+      |out: &egui::FullOutput, text: &str| texts(out).iter().any(|(t, _)| t.ends_with(text));
+
+    // x–y: (10, 0) has no log y and (-5, 100) no log x, so two points are left out.
+    let (ctx, mut app) = app_with(|st| {
+      for (x, y) in [
+        (1.0, 1.0),
+        (10.0, 0.0),
+        (100.0, 10.0),
+        (-5.0, 100.0),
+        (1000.0, 1000.0),
+      ] {
+        st.push_point("a", Some(x), y, None).unwrap();
+      }
+    });
+    app.log = [true, true, false];
+    let out = run(&ctx, &mut app);
+    assert!(shows(&out, "· 2 ≤ 0 hidden"), "{:?}", texts(&out));
+    app.log = [false; 3];
+    let out = run(&ctx, &mut app);
+    assert!(!shows(&out, "hidden"), "{:?}", texts(&out));
+
+    // Histogram: the values are y, so log x leaves out the 0 and the -2, while log counts
+    // leave out nothing.
+    let (ctx, mut app) = app_with(|st| {
+      for y in [1.0, 0.0, 5.0, -2.0, 3.0, 4.0] {
+        st.push_point("a", None, y, None).unwrap();
+      }
+      st.set_type(PlotType::Hist, None).unwrap();
+    });
+    app.log = [true, false, false];
+    let out = run(&ctx, &mut app);
+    assert!(shows(&out, "· 2 ≤ 0 hidden"), "{:?}", texts(&out));
+    app.log = [false, true, false];
+    let out = run(&ctx, &mut app);
+    assert!(!shows(&out, "hidden"), "{:?}", texts(&out));
+  }
+
+  #[test]
+  fn sig4_keeps_four_significant_digits() {
+    let cases = [
+      (1234.5678, "1235"),
+      (0.00123456, "0.001235"),
+      (12.5, "12.5"),
+      (1.0, "1"),
+      (-2.5, "-2.5"),
+      (123456.0, "1.235e5"),
+      (1e7, "1e7"),
+      (0.00001234, "1.234e-5"),
+      (0.0, "0"),
+    ];
+    for (v, text) in cases {
+      assert_eq!(sig4(v), text);
+    }
+  }
+
+  #[test]
+  fn hover_shows_the_values_before_the_log() {
+    let at = |x: f64, y: f64| HoverPosition::NearDataPoint {
+      plot_name: "a",
+      position: PlotPoint::new(x, y),
+      index: 0,
+    };
+    assert_eq!(
+      hover_text(&at(2.0, -1.0), [true, true]),
+      "a\nx = 100\ny = 0.1"
+    );
+    assert_eq!(
+      hover_text(&at(2.5, 1234.5678), [false, false]),
+      "a\nx = 2.5\ny = 1235"
+    );
+  }
+
+  #[test]
+  fn axis_titles_mark_the_log_axes() {
+    assert_eq!(axis_title("time", false), "time");
+    assert_eq!(axis_title("time", true), "time (log)");
+    assert_eq!(axis_title("", false), "");
+    assert_eq!(axis_title("", true), "(log)");
+  }
+
+  #[test]
   fn glyphs_are_in_default_fonts() {
     let (ctx, _) = setup("t");
     // Fonts are loaded by the first frame.
@@ -1534,5 +2183,40 @@ mod tests {
       st.set_type(PlotType::Points3d, Some("cloud")).unwrap();
     });
     shot("3d.png", &mut three_d);
+
+    // Exponential growth on a log y axis. The wave has values <= 0, which are left out.
+    let (_, mut xy_log) = app_with(|st| {
+      for i in 0..300 {
+        let t = i as f64;
+        st.push_point("growth", None, 10.0 * 1.04f64.powf(t), None)
+          .unwrap();
+        st.push_point("decay", None, 1e4 * 0.97f64.powf(t), None)
+          .unwrap();
+        st.push_point("wave", None, (t * 0.05).sin(), None).unwrap();
+      }
+    });
+    xy_log.log = [false, true, false];
+    shot("xy_log.png", &mut xy_log);
+
+    // Log-normal values in two groups, binned in log x and stacked with log counts. The normal
+    // deviates come from two low-discrepancy sequences, so the picture is the same on every run.
+    let normal = |i: usize, salt: f64| {
+      let t = i as f64;
+      let u1 = (t * 0.618_034 + salt).fract().max(1e-9);
+      let u2 = (t * 0.414_214 + 2.0 * salt).fract();
+      (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    };
+    let (_, mut hist_log) = app_with(|st| {
+      for i in 0..600 {
+        st.push_point("low", None, (0.5 * normal(i, 0.1)).exp(), None)
+          .unwrap();
+        st.push_point("high", None, (1.2 + 0.4 * normal(i, 0.7)).exp(), None)
+          .unwrap();
+      }
+      st.set_type(PlotType::Hist, None).unwrap();
+    });
+    hist_log.log = [true, true, false];
+    hist_log.hist_layout = HistLayout::Stack;
+    shot("hist_log.png", &mut hist_log);
   }
 }
