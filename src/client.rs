@@ -522,11 +522,76 @@ fn keep_std_handles_private() {
 #[cfg(unix)]
 fn keep_std_handles_private() {}
 
-/// Kills `child`. On Windows the processes that cmd started are killed too,
-/// since they would otherwise keep the output pipe open.
+/// Kills `child` and every process below it. The shell may run the command as
+/// a child of its own (dash, the Linux `sh`, always does; any shell does for
+/// `a; b` or `a | b`), and those processes would keep the output pipe open
+/// after the shell dies. On Windows the processes that cmd started go too.
 #[cfg(unix)]
 fn kill_process(child: &mut Child) {
+  unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+  }
+  const SIGKILL: i32 = 9;
+  // Collected before anything dies: an orphan is reparented and lost to us.
+  for pid in descendants(child.id()) {
+    // SAFETY: kill(2) on processes this complot started, by pid.
+    unsafe {
+      kill(pid as i32, SIGKILL);
+    }
+  }
   let _ = child.kill();
+}
+
+/// The processes below `pid`, at any depth.
+#[cfg(unix)]
+fn descendants(pid: u32) -> Vec<u32> {
+  let mut found = Vec::new();
+  let mut queue = vec![pid];
+  while let Some(parent) = queue.pop() {
+    for c in children(parent) {
+      found.push(c);
+      queue.push(c);
+    }
+  }
+  found
+}
+
+/// The direct children of `pid`, from /proc: no external tool needed.
+#[cfg(target_os = "linux")]
+fn children(pid: u32) -> Vec<u32> {
+  let Ok(dir) = fs::read_dir("/proc") else {
+    return Vec::new();
+  };
+  dir
+    .filter_map(Result::ok)
+    .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+    .filter(|&p| {
+      // /proc/P/stat is "P (comm) state ppid …"; comm may hold spaces and
+      // parentheses, so the fields are read after the last ')'.
+      fs::read_to_string(format!("/proc/{p}/stat")).is_ok_and(|stat| {
+        stat
+          .rsplit_once(')')
+          .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok())
+          == Some(pid)
+      })
+    })
+    .collect()
+}
+
+/// The direct children of `pid`, from `pgrep -P` (macOS and the BSDs).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn children(pid: u32) -> Vec<u32> {
+  Command::new("pgrep")
+    .args(["-P", &pid.to_string()])
+    .stderr(Stdio::null())
+    .output()
+    .map(|out| {
+      String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect()
+    })
+    .unwrap_or_default()
 }
 
 #[cfg(windows)]
@@ -2185,7 +2250,9 @@ mod tests {
     // The server closes its window right after the handshake, and the
     // command never writes anything.
     let server = fake_chunks(listener, name, &token, 1, Some(0));
-    let source = Source::Exec("sleep 30".to_string());
+    // A compound command, so that the shell forks it on every Unix, as dash
+    // (Linux's sh) does even for a single command.
+    let source = Source::Exec("sleep 30; true".to_string());
 
     let started = Instant::now();
     let result = push_source(&[(name.to_string(), false)], &source);
