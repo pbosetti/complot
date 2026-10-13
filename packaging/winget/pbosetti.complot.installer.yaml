@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
 
-PackageIdentifier: PaoloBosetti.complot
+PackageIdentifier: pbosetti.complot
 PackageVersion: "@VERSION@"
 InstallerType: zip
 NestedInstallerType: portable

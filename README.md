@@ -18,7 +18,7 @@ complot $h --close
 |---|---|
 | macOS, Linux (Homebrew) | `brew install pbosetti/mads/complot` |
 | Debian, Ubuntu | download the `.deb` from the [releases](https://github.com/pbosetti/complot/releases), then `sudo apt install ./complot_*.deb` |
-| Windows | `winget install PaoloBosetti.complot` |
+| Windows | `winget install pbosetti.complot` |
 | From source | `cargo install --git https://github.com/pbosetti/complot` |
 
 Archives for every platform are on the releases page too. `complot -V` prints

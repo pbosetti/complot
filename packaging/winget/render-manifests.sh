@@ -55,9 +55,9 @@ sha_zip=$(printf '%s\n' "$sha_zip" | tr 'a-f' 'A-F')
 # '|' cannot occur in a validated version or in a hex digest, so it is safe
 # as the sed delimiter.
 for name in \
-  PaoloBosetti.complot.yaml \
-  PaoloBosetti.complot.locale.en-US.yaml \
-  PaoloBosetti.complot.installer.yaml
+  pbosetti.complot.yaml \
+  pbosetti.complot.locale.en-US.yaml \
+  pbosetti.complot.installer.yaml
 do
   src="$script_dir/$name"
   [ -r "$src" ] || die "template not found: $src"

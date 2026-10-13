@@ -18,7 +18,7 @@ jobs:
     outputs:
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check that the tag matches the Cargo.toml version
         id: check
         run: |
@@ -71,7 +71,7 @@ jobs:
       COMPLOT_VERSION: ${{ needs.version.outputs.version }}
       RELEASE_TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -188,10 +188,10 @@ jobs:
         run: echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the Homebrew tap update."
       - name: Check out complot (for the formula template)
         if: env.HOMEBREW_TAP_TOKEN != ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Download checksums
         if: env.HOMEBREW_TAP_TOKEN != ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: checksums
           path: dist
@@ -204,7 +204,7 @@ jobs:
           ruby -c complot.rb
       - name: Check out the tap
         if: env.HOMEBREW_TAP_TOKEN != ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: pbosetti/homebrew-mads
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -245,7 +245,7 @@ jobs:
         if: env.WINGET_TOKEN != ''
         uses: vedantmgoyal9/winget-releaser@v2
         with:
-          identifier: PaoloBosetti.complot
+          identifier: pbosetti.complot
           release-tag: ${{ github.ref_name }}
           installers-regex: '\.zip$'
           token: ${{ secrets.WINGET_TOKEN }}
