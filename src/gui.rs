@@ -8,14 +8,23 @@ use crate::view3d::{Series3d, View3d};
 use eframe::egui;
 use egui_plot::{
   Bar, BarChart, GridInput, GridMark, HoverPosition, Legend, Line, Plot, PlotPoint, PlotPoints,
-  PlotUi, Points,
+  PlotResponse, PlotUi, Points,
 };
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 /// Series with more points than this are decimated to what fits on screen.
 const LOD_MIN: usize = 5_000;
+
+/// Ids of the x–y and histogram plots. Fixed, so that the tests can read their transforms.
+const XY_PLOT_ID: &str = "complot_plot";
+const HIST_PLOT_ID: &str = "complot_hist";
+
+/// How long the note after a copy stays on screen, in seconds.
+const COPY_NOTE_SECS: f64 = 1.2;
 
 /// Tableau 10, cycled by series index.
 const PALETTE: [egui::Color32; 10] = [
@@ -120,6 +129,26 @@ struct LogCache {
   dropped: usize,
 }
 
+/// What the copy menu offers. A right click freezes it, so that the menu shows and copies the
+/// values of the click whatever the pointer does while the menu is open. Values are as the axes
+/// show them: 10^v on a log axis.
+struct CopyMenu {
+  /// Where the click was. The menu opens here, and the note appears here.
+  at: egui::Pos2,
+  /// Series and (x, y) of the data point the hover snapped to, if it did.
+  point: Option<(String, [f64; 2])>,
+  /// (x, y) of the cursor.
+  cursor: [f64; 2],
+}
+
+/// The note after a copy, drawn at the menu until [`COPY_NOTE_SECS`] have passed.
+struct CopyNote {
+  at: egui::Pos2,
+  text: String,
+  /// egui time of the copy.
+  since: f64,
+}
+
 /// Settings and view state of one window. Settings live in memory only.
 struct PlotApp {
   name: String,
@@ -155,6 +184,10 @@ struct PlotApp {
   dropped: usize,
   /// Camera and display state of the 3D view.
   view3d: View3d,
+  /// The copy menu of the last right click on a plot, whose values it keeps.
+  copy_menu: Option<CopyMenu>,
+  /// The note of the last copy, while it is shown.
+  copy_note: Option<CopyNote>,
 }
 
 /// Locks the plot state. A poisoned lock is still used, since a panic cannot leave the data invalid.
@@ -544,9 +577,86 @@ fn axis_title(label: &str, log: bool) -> String {
   }
 }
 
+/// `v` as the axis shows it: 10^v on a log axis, else `v`.
+fn unlog(v: f64, log: bool) -> f64 {
+  if log { 10f64.powf(v) } else { v }
+}
+
+/// Id of the copy menu. Both plots use it, so that a click that changes the kind closes the menu.
+fn copy_menu_id() -> egui::Id {
+  egui::Id::new("complot_copy_menu")
+}
+
+/// `v` as the plot draws it: log10 on a log axis, else `v`. `None` where a log axis has no place
+/// for `v`.
+fn drawn_value(v: f64, log: bool) -> Option<f64> {
+  if log { to_log(v) } else { Some(v) }
+}
+
+/// The sample of series `name` that the plot draws at `at`, as it was pushed. Both sides use
+/// [`drawn_value`], so a drawn point equals its sample's drawn value exactly.
+fn sample_at(st: &PlotState, name: &str, at: [f64; 2], logs: [bool; 2]) -> Option<[f64; 2]> {
+  let series = st.series.iter().find(|s| s.name == name)?;
+  series.points.iter().find_map(|p| {
+    let x = drawn_value(p.x, logs[0])?;
+    let y = drawn_value(p.y, logs[1])?;
+    (x == at[0] && y == at[1]).then_some([p.x, p.y])
+  })
+}
+
+/// What a right click on a plot freezes for the copy menu: the cursor, and the data point the
+/// hover snapped to, if any. A snapped point copies its sample as pushed, found in `st`; the
+/// cursor has none, so it is `10^v` on a log axis. `logs` says which axes are logarithmic.
+fn copy_snapshot<R>(
+  response: &PlotResponse<R>,
+  st: &PlotState,
+  snapped: Option<(String, [f64; 2])>,
+  logs: [bool; 2],
+) -> Option<CopyMenu> {
+  let at = response.response.hover_pos()?;
+  let cursor = response.transform.value_from_position(at);
+  let point = snapped.map(|(series, drawn)| {
+    let [x, y] = sample_at(st, &series, drawn, logs)
+      .unwrap_or([unlog(drawn[0], logs[0]), unlog(drawn[1], logs[1])]);
+    (series, [x, y])
+  });
+  Some(CopyMenu {
+    at,
+    point,
+    cursor: [unlog(cursor.x, logs[0]), unlog(cursor.y, logs[1])],
+  })
+}
+
+/// Shows the copy menu `menu` over the plot `response`, while it is open. Returns the text of the
+/// button clicked, if one was: "x,y" at full precision.
+fn copy_menu_items(response: &egui::Response, menu: &CopyMenu) -> Option<String> {
+  let mut copied = None;
+  egui::Popup::context_menu(response)
+    .id(copy_menu_id())
+    .show(|ui| {
+      if let Some((series, [x, y])) = &menu.point
+        && ui
+          .button(format!("Copy point  {series}: {}, {}", sig4(*x), sig4(*y)))
+          .clicked()
+      {
+        copied = Some(format!("{x},{y}"));
+        ui.close();
+      }
+      let [x, y] = menu.cursor;
+      if ui
+        .button(format!("Copy cursor  {}, {}", sig4(x), sig4(y)))
+        .clicked()
+      {
+        copied = Some(format!("{x},{y}"));
+        ui.close();
+      }
+    });
+  copied
+}
+
 /// Hover text of a point: its series, then its values before the log axes, 10^v on a log axis.
 fn hover_text(pos: &HoverPosition<'_>, logs: [bool; 2]) -> String {
-  let value = |v: f64, log: bool| sig4(if log { 10f64.powf(v) } else { v });
+  let value = |v: f64, log: bool| sig4(unlog(v, log));
   match pos {
     HoverPosition::NearDataPoint {
       plot_name,
@@ -617,13 +727,16 @@ impl PlotApp {
       log_cache: None,
       dropped: 0,
       view3d: View3d::default(),
+      copy_menu: None,
+      copy_note: None,
     }
   }
 
-  /// Draws the window: the settings panel, then the plot.
+  /// Draws the window: the settings panel, then the plot and the note of a copy.
   fn draw(&mut self, ui: &mut egui::Ui) {
     self.side_panel(ui);
     self.plot(ui);
+    self.show_copy_note(ui.ctx());
   }
 
   /// The side panel: the settings while it is open, else a narrow strip with a button.
@@ -983,11 +1096,29 @@ impl PlotApp {
     let total = st.total_points();
     let mut follow: Option<bool> = None;
     let mut decimated: Option<(usize, usize)> = None;
+    let mut plot_response = None;
+    let mut frozen = None;
+    // The copy menu shows the values that the hover label would, so the label waits for it.
+    let menu_open = egui::Popup::is_id_open(ui.ctx(), copy_menu_id());
 
     egui::CentralPanel::default().show(ui, |ui| {
-      let mut plot = Plot::new("complot_plot")
+      // The data point the hover snaps to in this frame: the formatter runs only while hovering.
+      let snapped = RefCell::new(None);
+      let snapped_ref = &snapped;
+      let mut plot = Plot::new(XY_PLOT_ID)
+        .id(egui::Id::new(XY_PLOT_ID))
         .show_grid(grid)
-        .label_formatter(move |pos| Some(hover_text(pos, [log_x, log_y])));
+        .label_formatter(move |pos| {
+          *snapped_ref.borrow_mut() = match pos {
+            HoverPosition::NearDataPoint {
+              plot_name,
+              position,
+              ..
+            } => Some((plot_name.to_string(), [position.x, position.y])),
+            HoverPosition::Elsewhere { .. } => None,
+          };
+          (!menu_open).then(|| hover_text(pos, [log_x, log_y]))
+        });
       if legend {
         plot = plot.legend(Legend::default());
       }
@@ -1083,8 +1214,15 @@ impl PlotApp {
       if total == 0 {
         paint_waiting(ui, response.response.rect, name);
       }
+      if response.response.secondary_clicked() {
+        frozen = copy_snapshot(&response, st, snapped.take(), [log_x, log_y]);
+      }
+      plot_response = Some(response.response);
     });
 
+    if let Some(response) = &plot_response {
+      self.update_copy_menu(response, frozen);
+    }
     if let Some(on) = follow {
       self.follow = on;
     }
@@ -1114,13 +1252,17 @@ impl PlotApp {
     let x_title = axis_title(x_label, log_x);
     let y_title = axis_title("count", log_y);
     let mut follow: Option<bool> = None;
+    let mut plot_response = None;
+    let mut frozen = None;
+    let menu_open = egui::Popup::is_id_open(ui.ctx(), copy_menu_id());
 
     egui::CentralPanel::default().show(ui, |ui| {
-      let mut plot = Plot::new("complot_hist")
+      let mut plot = Plot::new(HIST_PLOT_ID)
+        .id(egui::Id::new(HIST_PLOT_ID))
         .show_grid(grid)
         .x_axis_label(x_title)
         .y_axis_label(y_title)
-        .label_formatter(move |pos| Some(hover_text(pos, [log_x, log_y])));
+        .label_formatter(move |pos| (!menu_open).then(|| hover_text(pos, [log_x, log_y])));
       if log_x {
         plot = plot
           .x_grid_spacer(log_grid)
@@ -1144,8 +1286,15 @@ impl PlotApp {
       if total == 0 {
         paint_waiting(ui, response.response.rect, name);
       }
+      if response.response.secondary_clicked() {
+        frozen = copy_snapshot(&response, st, None, [log_x, log_y]);
+      }
+      plot_response = Some(response.response);
     });
 
+    if let Some(response) = &plot_response {
+      self.update_copy_menu(response, frozen);
+    }
     if let Some(on) = follow {
       self.follow = on;
     }
@@ -1155,6 +1304,8 @@ impl PlotApp {
 
   /// The 3D view of the series that have z values. Each series is drawn with its geometry.
   fn three_d_plot(&mut self, ui: &mut egui::Ui, st: &PlotState) {
+    // The copy menu is for the x–y and histogram plots, so it closes here.
+    egui::Popup::close_id(ui.ctx(), copy_menu_id());
     self.view3d.point_radius = self.point_radius;
     self.view3d.line_width = self.line_width;
     self.view3d.legend = self.legend;
@@ -1216,6 +1367,48 @@ impl PlotApp {
     }
     self.dropped = dropped;
   }
+
+  /// Freezes the copy menu on the right click that gave `frozen`, then shows it over the plot
+  /// `response` while it is open. A copy puts its text on the clipboard and starts the note.
+  fn update_copy_menu(&mut self, response: &egui::Response, frozen: Option<CopyMenu>) {
+    if let Some(menu) = frozen {
+      self.copy_menu = Some(menu);
+    }
+    let Some(menu) = &self.copy_menu else {
+      return;
+    };
+    if let Some(text) = copy_menu_items(response, menu) {
+      self.copy_note = Some(CopyNote {
+        at: menu.at,
+        text: format!("Copied {text}"),
+        since: response.ctx.input(|i| i.time),
+      });
+      response.ctx.copy_text(text);
+    }
+  }
+
+  /// Shows the note of the last copy by the menu, until [`COPY_NOTE_SECS`] have passed. While it
+  /// shows, a repaint is requested for the moment it goes.
+  fn show_copy_note(&mut self, ctx: &egui::Context) {
+    let Some(note) = &self.copy_note else {
+      return;
+    };
+    let left = COPY_NOTE_SECS - (ctx.input(|i| i.time) - note.since);
+    if left <= 0.0 {
+      self.copy_note = None;
+      return;
+    }
+    ctx.request_repaint_after(Duration::from_secs_f64(left));
+    let style = ctx.global_style();
+    egui::Area::new(egui::Id::new("complot_copy_note"))
+      .order(egui::Order::Tooltip)
+      .pivot(egui::Align2::LEFT_BOTTOM)
+      .fixed_pos(note.at + egui::vec2(4.0, -4.0))
+      .interactable(false)
+      .show(ctx, |ui| {
+        egui::Frame::popup(&style).show(ui, |ui| ui.label(note.text.as_str()));
+      });
+  }
 }
 
 impl eframe::App for PlotApp {
@@ -1241,6 +1434,7 @@ impl eframe::App for PlotApp {
 mod tests {
   use super::*;
   use crate::model::PlotType;
+  use egui_plot::{PlotMemory, PlotTransform};
 
   /// Time between frames, as at 60 Hz. Animations run on this clock.
   const FRAME_TIME: f64 = 1.0 / 60.0;
@@ -1391,18 +1585,139 @@ mod tests {
       .center()
   }
 
+  /// The texts of `output` that start with `prefix`.
+  fn texts_starting(output: &egui::FullOutput, prefix: &str) -> Vec<String> {
+    texts(output)
+      .into_iter()
+      .map(|(t, _)| t)
+      .filter(|t| t.starts_with(prefix))
+      .collect()
+  }
+
+  /// Centre of the first text of `output` that starts with `prefix`.
+  fn text_starting_at(output: &egui::FullOutput, prefix: &str) -> egui::Pos2 {
+    texts(output)
+      .into_iter()
+      .find(|(t, _)| t.starts_with(prefix))
+      .unwrap_or_else(|| panic!("no text starting '{prefix}' on screen"))
+      .1
+      .center()
+  }
+
+  /// The texts put on the clipboard by `output`.
+  fn copied(output: &egui::FullOutput) -> Vec<String> {
+    output
+      .platform_output
+      .commands
+      .iter()
+      .filter_map(|c| match c {
+        egui::OutputCommand::CopyText(text) => Some(text.clone()),
+        _ => None,
+      })
+      .collect()
+  }
+
+  /// The two numbers of a copied "x,y".
+  fn parse_pair(text: &str) -> (f64, f64) {
+    let (x, y) = text
+      .split_once(',')
+      .unwrap_or_else(|| panic!("'{text}' is not x,y"));
+    (
+      x.parse()
+        .unwrap_or_else(|_| panic!("'{x}' is not a number")),
+      y.parse()
+        .unwrap_or_else(|_| panic!("'{y}' is not a number")),
+    )
+  }
+
+  /// The transform of the plot `id`, as its last frame drew it.
+  fn plot_transform(ctx: &egui::Context, id: &str) -> PlotTransform {
+    PlotMemory::load(ctx, egui::Id::new(id))
+      .expect("the plot was drawn")
+      .transform()
+  }
+
+  /// Runs `frames` frames of the whole window without input, and returns the output of the last.
+  fn whole_settled(ctx: &egui::Context, app: &mut PlotApp, frames: usize) -> egui::FullOutput {
+    let mut output = whole_frame(ctx, app, Vec::new());
+    for _ in 1..frames {
+      output = whole_frame(ctx, app, Vec::new());
+    }
+    output
+  }
+
+  /// Clicks `button` at `pos` on the whole window: hovers there, then presses and releases.
+  /// Returns the output of the frame of the release, where the click registers.
+  fn click_in(
+    ctx: &egui::Context,
+    app: &mut PlotApp,
+    pos: egui::Pos2,
+    button: egui::PointerButton,
+  ) -> egui::FullOutput {
+    whole_frame(ctx, app, vec![pointer_moved(pos)]);
+    whole_frame(
+      ctx,
+      app,
+      vec![pointer_moved(pos), button_event(button, pos, true)],
+    );
+    whole_frame(ctx, app, vec![button_event(button, pos, false)])
+  }
+
+  /// Runs one frame of the whole window at 2 pixels per point, with `events`. Its textures go to
+  /// `renderer`, so that a later frame can be rendered; rendering is slow, so frames are not.
+  fn frame_at_2x(
+    ctx: &egui::Context,
+    renderer: &mut crate::snapshot::Renderer,
+    app: &mut PlotApp,
+    events: Vec<egui::Event>,
+  ) -> egui::FullOutput {
+    let viewport = egui::ViewportInfo {
+      native_pixels_per_point: Some(2.0),
+      ..Default::default()
+    };
+    let input = egui::RawInput {
+      viewports: std::iter::once((egui::ViewportId::ROOT, viewport)).collect(),
+      screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+      time: Some(ctx.input(|i| i.time) + FRAME_TIME),
+      predicted_dt: FRAME_TIME as f32,
+      events,
+      ..Default::default()
+    };
+    let mut output = ctx.run_ui(input, |ui| app.draw(ui));
+    renderer.update(&output.textures_delta);
+    output.textures_delta.clear();
+    output
+  }
+
+  /// A context and an x–y plot of series "a", with (0.1, 0.987) among its points, drawn for a
+  /// few frames so that its transform is known.
+  fn snapped_app() -> (egui::Context, PlotApp) {
+    let (ctx, mut app) = app_with(|st| {
+      for (x, y) in [(0.0, 0.0), (0.1, 0.987), (0.5, 0.3), (1.0, 1.0)] {
+        st.push_point("a", Some(x), y, None).unwrap();
+      }
+    });
+    whole_settled(&ctx, &mut app, 3);
+    (ctx, app)
+  }
+
   fn pointer_moved(pos: egui::Pos2) -> egui::Event {
     egui::Event::PointerMoved(pos)
   }
 
-  /// A press or a release of the primary button at `pos`.
-  fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+  /// A press or a release of `button` at `pos`.
+  fn button_event(button: egui::PointerButton, pos: egui::Pos2, pressed: bool) -> egui::Event {
     egui::Event::PointerButton {
       pos,
-      button: egui::PointerButton::Primary,
+      button,
       pressed,
       modifiers: egui::Modifiers::NONE,
     }
+  }
+
+  /// A press or a release of the primary button at `pos`.
+  fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    button_event(egui::PointerButton::Primary, pos, pressed)
   }
 
   /// Clicks at `pos`. The pointer hovers there first, so the widget under it is known.
@@ -2121,6 +2436,377 @@ mod tests {
         "no glyph for {glyph}"
       );
     }
+  }
+
+  #[test]
+  fn copy_menu_offers_the_point_and_the_cursor_when_snapped() {
+    let (ctx, mut app) = snapped_app();
+    let at = plot_transform(&ctx, XY_PLOT_ID).position_from_point(&PlotPoint::new(0.1, 0.987));
+    let released = click_in(&ctx, &mut app, at, egui::PointerButton::Secondary);
+    assert!(copied(&released).is_empty(), "a right click copies nothing");
+    let out = whole_settled(&ctx, &mut app, 2);
+    assert_eq!(
+      texts_starting(&out, "Copy point"),
+      ["Copy point  a: 0.1, 0.987"]
+    );
+    assert_eq!(texts_starting(&out, "Copy cursor").len(), 1);
+    // The pointer is still over the plot, but the menu replaces the hover label.
+    assert!(!texts(&out).iter().any(|(t, _)| t.contains("x = ")));
+
+    let out = click_in(
+      &ctx,
+      &mut app,
+      text_starting_at(&out, "Copy point"),
+      egui::PointerButton::Primary,
+    );
+    assert_eq!(copied(&out), ["0.1,0.987"]);
+    let out = whole_settled(&ctx, &mut app, 2);
+    assert!(
+      texts_starting(&out, "Copy point").is_empty()
+        && texts_starting(&out, "Copy cursor").is_empty(),
+      "the menu closes after a copy"
+    );
+  }
+
+  #[test]
+  fn copy_menu_copies_the_cursor_away_from_data() {
+    let (ctx, mut app) = app_with(|st| {
+      for (x, y) in [(0.0, 0.0), (1.0, 1.0)] {
+        st.push_point("a", Some(x), y, None).unwrap();
+      }
+    });
+    whole_settled(&ctx, &mut app, 3);
+    let plot = plot_transform(&ctx, XY_PLOT_ID);
+    // Well off the segment from (0, 0) to (1, 1), which the hover snaps to along its length.
+    let at = plot.position_from_point(&PlotPoint::new(0.5, 0.2));
+    click_in(&ctx, &mut app, at, egui::PointerButton::Secondary);
+    let out = whole_settled(&ctx, &mut app, 2);
+    assert!(texts_starting(&out, "Copy point").is_empty());
+    assert_eq!(texts_starting(&out, "Copy cursor").len(), 1);
+
+    let out = click_in(
+      &ctx,
+      &mut app,
+      text_starting_at(&out, "Copy cursor"),
+      egui::PointerButton::Primary,
+    );
+    let text = copied(&out);
+    assert_eq!(text.len(), 1, "one copy: {text:?}");
+    let (x, y) = parse_pair(&text[0]);
+    let bounds = plot.bounds();
+    let [min, max] = [bounds.min(), bounds.max()];
+    assert!(
+      (min[0]..=max[0]).contains(&x) && (min[1]..=max[1]).contains(&y),
+      "{x},{y} is outside the plot {min:?}..{max:?}"
+    );
+    assert!(
+      (x - 0.5).abs() < 0.01 && (y - 0.2).abs() < 0.01,
+      "{x},{y} is not the cursor"
+    );
+  }
+
+  #[test]
+  fn copy_menu_copies_the_original_values_on_a_log_axis() {
+    let (ctx, mut app) = app_with(|st| {
+      for (x, y) in [(0.1, 1000.0), (0.5, 10.0), (1.0, 0.1)] {
+        st.push_point("a", Some(x), y, None).unwrap();
+      }
+    });
+    app.log = [false, true, false];
+    whole_settled(&ctx, &mut app, 3);
+    // On the log axis the point 1000 lies at log10(1000) = 3.
+    let at = plot_transform(&ctx, XY_PLOT_ID).position_from_point(&PlotPoint::new(0.1, 3.0));
+    click_in(&ctx, &mut app, at, egui::PointerButton::Secondary);
+    let out = whole_settled(&ctx, &mut app, 2);
+    assert_eq!(
+      texts_starting(&out, "Copy point"),
+      ["Copy point  a: 0.1, 1000"]
+    );
+
+    let out = click_in(
+      &ctx,
+      &mut app,
+      text_starting_at(&out, "Copy point"),
+      egui::PointerButton::Primary,
+    );
+    assert_eq!(copied(&out), ["0.1,1000"]);
+  }
+
+  #[test]
+  fn histogram_copy_menu_offers_only_the_cursor() {
+    let (ctx, mut app) = app_with(|st| {
+      for i in 0..50 {
+        st.push_point("a", None, i as f64, None).unwrap();
+      }
+      st.set_type(PlotType::Hist, None).unwrap();
+    });
+    whole_settled(&ctx, &mut app, 3);
+    let at = plot_transform(&ctx, HIST_PLOT_ID).frame().center();
+    click_in(&ctx, &mut app, at, egui::PointerButton::Secondary);
+    let out = whole_settled(&ctx, &mut app, 2);
+    assert!(texts_starting(&out, "Copy point").is_empty());
+    assert_eq!(texts_starting(&out, "Copy cursor").len(), 1);
+
+    let out = click_in(
+      &ctx,
+      &mut app,
+      text_starting_at(&out, "Copy cursor"),
+      egui::PointerButton::Primary,
+    );
+    let text = copied(&out);
+    assert_eq!(text.len(), 1, "one copy: {text:?}");
+    parse_pair(&text[0]);
+  }
+
+  #[test]
+  fn three_d_right_click_opens_no_menu() {
+    let (ctx, mut app) = app_with(|st| {
+      for i in 0..20 {
+        let t = i as f64;
+        st.push_point("a", Some(t), t.sin(), Some(t.cos())).unwrap();
+      }
+      st.set_type(PlotType::Points3d, None).unwrap();
+    });
+    whole_settled(&ctx, &mut app, 3);
+    let released = click_in(
+      &ctx,
+      &mut app,
+      egui::pos2(555.0, 280.0),
+      egui::PointerButton::Secondary,
+    );
+    let out = whole_settled(&ctx, &mut app, 2);
+    assert!(copied(&released).is_empty());
+    assert!(
+      texts_starting(&out, "Copy point").is_empty()
+        && texts_starting(&out, "Copy cursor").is_empty(),
+      "{:?}",
+      texts(&out)
+    );
+  }
+
+  #[test]
+  fn right_drag_box_zooms_and_opens_no_menu() {
+    let (ctx, mut app) = snapped_app();
+    let plot = plot_transform(&ctx, XY_PLOT_ID);
+    let start = plot.position_from_point(&PlotPoint::new(0.2, 0.2));
+    let end = plot.position_from_point(&PlotPoint::new(0.6, 0.6));
+    let before = plot.bounds().width();
+
+    whole_frame(&ctx, &mut app, vec![pointer_moved(start)]);
+    whole_frame(
+      &ctx,
+      &mut app,
+      vec![
+        pointer_moved(start),
+        button_event(egui::PointerButton::Secondary, start, true),
+      ],
+    );
+    const STEPS: usize = 10;
+    for i in 1..=STEPS {
+      let pos = start + (end - start) * (i as f32 / STEPS as f32);
+      whole_frame(&ctx, &mut app, vec![pointer_moved(pos)]);
+    }
+    let released = whole_frame(
+      &ctx,
+      &mut app,
+      vec![button_event(egui::PointerButton::Secondary, end, false)],
+    );
+    let out = whole_settled(&ctx, &mut app, 2);
+
+    assert!(copied(&released).is_empty());
+    assert!(
+      texts_starting(&out, "Copy point").is_empty()
+        && texts_starting(&out, "Copy cursor").is_empty(),
+      "a drag opens no menu"
+    );
+    assert!(!app.follow, "the box zoom turns follow off");
+    let zoomed = plot_transform(&ctx, XY_PLOT_ID).bounds().width();
+    assert!(
+      zoomed < 0.9 * before,
+      "width {zoomed} is not zoomed in on {before}"
+    );
+  }
+
+  #[test]
+  fn copy_menu_keeps_the_values_of_its_click() {
+    let (ctx, mut app) = snapped_app();
+    let plot = plot_transform(&ctx, XY_PLOT_ID);
+    let at = plot.position_from_point(&PlotPoint::new(0.1, 0.987));
+    click_in(&ctx, &mut app, at, egui::PointerButton::Secondary);
+    let open = whole_settled(&ctx, &mut app, 2);
+    let cursor = texts_starting(&open, "Copy cursor");
+    assert_eq!(cursor.len(), 1);
+
+    // Moved away, over the plot where no data lies: the hover snaps elsewhere, the menu does not.
+    let away = plot.position_from_point(&PlotPoint::new(0.9, 0.1));
+    whole_frame(&ctx, &mut app, vec![pointer_moved(away)]);
+    let moved = whole_settled(&ctx, &mut app, 3);
+    assert_eq!(texts_starting(&moved, "Copy cursor"), cursor);
+    assert_eq!(
+      texts_starting(&moved, "Copy point"),
+      ["Copy point  a: 0.1, 0.987"]
+    );
+
+    let out = click_in(
+      &ctx,
+      &mut app,
+      text_starting_at(&moved, "Copy point"),
+      egui::PointerButton::Primary,
+    );
+    assert_eq!(copied(&out), ["0.1,0.987"]);
+  }
+
+  #[test]
+  fn copy_note_shows_for_1_2_seconds() {
+    let (ctx, mut app) = snapped_app();
+    let at = plot_transform(&ctx, XY_PLOT_ID).position_from_point(&PlotPoint::new(0.1, 0.987));
+    click_in(&ctx, &mut app, at, egui::PointerButton::Secondary);
+    let open = whole_settled(&ctx, &mut app, 2);
+    let released = click_in(
+      &ctx,
+      &mut app,
+      text_starting_at(&open, "Copy point"),
+      egui::PointerButton::Primary,
+    );
+    assert_eq!(copied(&released), ["0.1,0.987"]);
+    let shows = |out: &egui::FullOutput| texts(out).iter().any(|(t, _)| t == "Copied 0.1,0.987");
+    // The note's area is laid out invisibly on its first frame, so it shows from the next one.
+    assert!(shows(&whole_settled(&ctx, &mut app, 1)));
+    // Half a second on, the note is still there; 1.5 s on, it is gone.
+    assert!(shows(&whole_settled(&ctx, &mut app, 30)));
+    assert!(
+      !shows(&whole_settled(&ctx, &mut app, 60)),
+      "the note outlives 1.2 s"
+    );
+  }
+
+  #[test]
+  fn copy_menu_copies_the_pushed_values_on_every_axis_scale() {
+    // 10^log10(12.5) is 12.500000000000002, so copying through the log axis would be wrong.
+    let samples = [
+      ((12.5, 3.7), "12.5,3.7"),
+      ((3.7, 0.3), "3.7,0.3"),
+      ((0.3, 12.5), "0.3,12.5"),
+    ];
+    let drawn = |v: f64, log: bool| {
+      if log {
+        to_log(v).expect("a positive value")
+      } else {
+        v
+      }
+    };
+    for logs in [[false, false], [true, false], [false, true], [true, true]] {
+      let (ctx, mut app) = app_with(|st| {
+        for ((x, y), _) in samples {
+          st.push_point("a", Some(x), y, None).unwrap();
+        }
+      });
+      app.log = [logs[0], logs[1], false];
+      whole_settled(&ctx, &mut app, 3);
+      for ((x, y), text) in samples {
+        let plot = plot_transform(&ctx, XY_PLOT_ID);
+        let at = plot.position_from_point(&PlotPoint::new(drawn(x, logs[0]), drawn(y, logs[1])));
+        click_in(&ctx, &mut app, at, egui::PointerButton::Secondary);
+        let open = whole_settled(&ctx, &mut app, 2);
+        assert_eq!(
+          texts_starting(&open, "Copy point").len(),
+          1,
+          "no point snapped at {text} on {logs:?}"
+        );
+        let out = click_in(
+          &ctx,
+          &mut app,
+          text_starting_at(&open, "Copy point"),
+          egui::PointerButton::Primary,
+        );
+        assert_eq!(copied(&out), [text], "on {logs:?}");
+      }
+    }
+  }
+
+  #[test]
+  fn copy_menu_finds_the_sample_of_a_decimated_log_series() {
+    // Longer than LOD_MIN and sorted, so its line and its points are decimated to fit the screen.
+    let samples: Vec<(f64, f64)> = (0..6000)
+      .map(|i| (1.0 + i as f64 * 0.37, 0.3 + i as f64 * 0.11))
+      .collect();
+    let (ctx, mut app) = app_with(|st| {
+      for &(x, y) in &samples {
+        st.push_point("a", Some(x), y, None).unwrap();
+      }
+    });
+    app.log = [true, true, false];
+    whole_settled(&ctx, &mut app, 3);
+    let (x, y) = samples[3001];
+    let plot = plot_transform(&ctx, XY_PLOT_ID);
+    let at = plot.position_from_point(&PlotPoint::new(
+      to_log(x).expect("positive"),
+      to_log(y).expect("positive"),
+    ));
+    click_in(&ctx, &mut app, at, egui::PointerButton::Secondary);
+    let open = whole_settled(&ctx, &mut app, 2);
+    assert_eq!(texts_starting(&open, "Copy point").len(), 1);
+    let out = click_in(
+      &ctx,
+      &mut app,
+      text_starting_at(&open, "Copy point"),
+      egui::PointerButton::Primary,
+    );
+    // The point snapped to is a kept sample, which must be copied as pushed. Many of these
+    // values come back inexact through log10, so a copy through 10^v would not match any sample.
+    let text = copied(&out);
+    assert_eq!(text.len(), 1, "one copy: {text:?}");
+    assert!(
+      samples.iter().any(|(x, y)| format!("{x},{y}") == text[0]),
+      "{} is not a sample",
+      text[0]
+    );
+  }
+
+  /// The copy menu open over a snapped point, rendered at 2 pixels per point for a look. Writes
+  /// `copy-menu.png` into the directory named by `COMPLOT_SNAPSHOT_DIR`, if it is set.
+  #[test]
+  #[ignore = "writes PNG files: set COMPLOT_SNAPSHOT_DIR and run with --ignored"]
+  fn copy_menu_snapshot() {
+    let Some(dir) = std::env::var_os("COMPLOT_SNAPSHOT_DIR").map(std::path::PathBuf::from) else {
+      return;
+    };
+    let (ctx, mut app) = app_with(|st| {
+      for i in 0..300 {
+        let t = i as f64 * 0.05;
+        st.push_point("sine", Some(t), t.sin(), None).unwrap();
+        st.push_point("cosine", Some(t), t.cos(), None).unwrap();
+      }
+    });
+    let mut renderer = crate::snapshot::Renderer::default();
+    for _ in 0..3 {
+      frame_at_2x(&ctx, &mut renderer, &mut app, Vec::new());
+    }
+    let t: f64 = 31.0 * 0.05;
+    let at = plot_transform(&ctx, XY_PLOT_ID).position_from_point(&PlotPoint::new(t, t.sin()));
+    let secondary = egui::PointerButton::Secondary;
+    frame_at_2x(&ctx, &mut renderer, &mut app, vec![pointer_moved(at)]);
+    frame_at_2x(
+      &ctx,
+      &mut renderer,
+      &mut app,
+      vec![pointer_moved(at), button_event(secondary, at, true)],
+    );
+    frame_at_2x(
+      &ctx,
+      &mut renderer,
+      &mut app,
+      vec![button_event(secondary, at, false)],
+    );
+    // The menu fades in over its first frames, so it is drawn fully only after some more.
+    let mut last = None;
+    for _ in 0..30 {
+      last = Some(frame_at_2x(&ctx, &mut renderer, &mut app, Vec::new()));
+    }
+    renderer
+      .render(&ctx, last.expect("frames ran"))
+      .write_png(&dir.join("copy-menu.png"))
+      .expect("the PNG is written");
   }
 
   #[test]

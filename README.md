@@ -223,7 +223,10 @@ swaps, and with `--by`, every plot the stream has reached so far.
 ## The window
 
 Drag or scroll to pan, Ctrl/⌘+scroll or pinch to zoom, right-drag to
-box-zoom, double-click to fit. The side panel (collapsible with ⏴) holds the
+box-zoom, double-click to fit. Hovering shows the coordinates of the nearest
+point; a right click opens a small menu that copies either that point or the
+cursor position to the clipboard, as `x,y` at full precision (real values, also
+on log axes). The side panel (collapsible with ⏴) holds the
 few graphical settings:
 
 - **Kind**: x–y, histogram or 3D (3D is greyed out until every series has z).
