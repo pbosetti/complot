@@ -295,18 +295,31 @@ impl Push {
   }
 }
 
+/// Starts the chunk of `conn` for plot `name`, with `Frames` first if `frames`.
+fn open_chunk(name: &str, conn: Connection, frames: bool) -> Result<Session, String> {
+  let mut session = Session::open(name, conn);
+  if frames {
+    session.send(&Msg::Frames)?;
+  }
+  Ok(session)
+}
+
 /// Pushes the lines of `path` (`-` for stdin) to every plot in `plots`, each
 /// over a connection of its own, so that each file is one CSV chunk per plot.
-/// The source is read once, and each batch goes to every plot still open. A
-/// plot that is lost is reported and dropped; the others go on, and the
-/// source is not read any further once none is left.
-fn push_file(plots: &[String], path: &Path) -> Result<Push, String> {
+/// The plots are `(name, frames)` pairs: with `frames`, the chunk starts with
+/// `Frames`. The source is read once, and each batch goes to every plot still
+/// open. A plot that is lost is reported and dropped; the others go on, and
+/// the source is not read any further once none is left.
+fn push_file(plots: &[(String, bool)], path: &Path) -> Result<Push, String> {
   let mut lines = open_source(path)?;
   let mut push = Push::default();
   let mut sessions = Vec::new();
-  for plot in plots {
+  for (plot, frames) in plots {
     match connect(plot) {
-      Ok(conn) => sessions.push(Session::open(plot, conn)),
+      Ok(conn) => match open_chunk(plot, conn, *frames) {
+        Ok(session) => sessions.push(session),
+        Err(msg) => push.lose(plot, msg),
+      },
       Err(e) => push.lose(plot, connect_error(plot, e)),
     }
   }
@@ -433,7 +446,7 @@ fn execute(cli: &Cli) -> Result<bool, String> {
 
   let mut failed = send_all(&name, first, &setup_messages(cli, aes.as_ref(), true))?;
   for path in &cli.files {
-    let push = push_file(std::slice::from_ref(&name), path)?;
+    let push = push_file(&[(name.clone(), cli.frames)], path)?;
     failed |= push.failed;
     if !push.closed.is_empty() {
       // The window is gone: nothing more to send, not even `--close`.
@@ -637,10 +650,10 @@ fn execute_multi(shared: &Cli, plots: &[(String, Cli)]) -> Result<bool, String> 
 
   // Each shared file is read once, and goes to every plot that is still there.
   for path in &shared.files {
-    let targets: Vec<String> = plans
+    let targets: Vec<(String, bool)> = plans
       .iter()
       .filter(|plan| !plan.gone)
-      .map(|plan| plan.name.clone())
+      .map(|plan| (plan.name.clone(), plan.cli.frames))
       .collect();
     if targets.is_empty() {
       break;
@@ -658,7 +671,7 @@ fn execute_multi(shared: &Cli, plots: &[(String, Cli)]) -> Result<bool, String> 
   // Each plot's own files go to that plot alone.
   for plan in plans.iter_mut().filter(|plan| !plan.gone) {
     for path in &plan.cli.files {
-      let push = push_file(std::slice::from_ref(&plan.name), path)?;
+      let push = push_file(&[(plan.name.clone(), plan.cli.frames)], path)?;
       failed |= push.failed;
       if !push.closed.is_empty() {
         plan.gone = true;
@@ -705,6 +718,8 @@ struct Routing {
   setup: Vec<Msg>,
   /// Opens a plot that is not running.
   create: bool,
+  /// `--frames`: each new connection starts with `Frames`, and blank lines end frames.
+  frames: bool,
   /// Plots that are not open, or whose window was closed. Never sent to again.
   dead: Vec<String>,
   /// Plots that were routed rows, in order of first use. `--close` closes them.
@@ -760,6 +775,7 @@ fn route_rows(cli: &Cli) -> Result<bool, String> {
   let mut run = Routing {
     setup: setup_messages(cli, aes.as_ref(), false),
     create: cli.create,
+    frames: cli.frames,
     dead: Vec::new(),
     used: Vec::new(),
     printed: HashSet::new(),
@@ -801,7 +817,33 @@ fn route_source(run: &mut Routing, col: &str, path: &Path) -> Result<(), String>
     }
     strip_newline(&mut raw);
     match router.route(&String::from_utf8_lossy(&raw)) {
-      Routed::Skip | Routed::Header(_) => {}
+      Routed::Skip => {}
+      Routed::Blank => {
+        // Ends the frame of every plot open to this source.
+        if run.frames {
+          for feed in feeds.values_mut() {
+            feed.batch.push(String::new());
+          }
+        }
+      }
+      Routed::Clear(names) => {
+        // Restarts the open plots. Plots opened later get the new header.
+        let directive = match names {
+          Some(names) if !names.is_empty() => format!("#clear {names}"),
+          _ => "#clear".to_string(),
+        };
+        for feed in feeds.values_mut() {
+          feed.batch.push(directive.clone());
+        }
+      }
+      Routed::Header(header) => {
+        // A header after a `#clear` without names: the open plots need it too.
+        if !header.is_empty() {
+          for feed in feeds.values_mut() {
+            feed.batch.push(header.clone());
+          }
+        }
+      }
       Routed::Reject(msg) => run.reject(msg),
       Routed::Row { plot, line } => {
         if !run.is_dead(&plot) {
@@ -837,9 +879,9 @@ fn route_source(run: &mut Routing, col: &str, path: &Path) -> Result<(), String>
   Ok(())
 }
 
-/// Opens the connection to `plot` for the rows of the current source: the
-/// shared configuration, then the header. `None` if the plot cannot take
-/// rows, which is reported and remembered.
+/// Opens the connection to `plot` for the rows of the current source: `Frames`
+/// with `--frames`, the shared configuration, then the header. `None` if the
+/// plot cannot take rows, which is reported and remembered.
 fn open_feed(run: &mut Routing, plot: &str, header: Option<&str>) -> Option<Feed> {
   let conn = match connect(plot) {
     Ok(conn) => conn,
@@ -860,12 +902,13 @@ fn open_feed(run: &mut Routing, plot: &str, header: Option<&str>) -> Option<Feed
     }
   };
   let mut session = Session::open(plot, conn);
+  let frames = run.frames.then_some(Msg::Frames);
   let header = header.filter(|h| !h.is_empty()).map(|h| Msg::Rows {
     lines: vec![h.to_string()],
   });
-  let sent = run
-    .setup
+  let sent = frames
     .iter()
+    .chain(&run.setup)
     .chain(&header)
     .try_for_each(|msg| session.send(msg));
   match sent {
@@ -1149,7 +1192,7 @@ mod tests {
       })
       .collect();
     fs::write(&path, text).unwrap();
-    let pushed = push_file(&[name.to_string()], &path).map(|push| push.failed);
+    let pushed = push_file(&[(name.to_string(), false)], &path).map(|push| push.failed);
     fs::remove_file(&path).unwrap();
     assert_eq!(pushed, Ok(false));
     registry::remove_entry(name);
@@ -1205,7 +1248,7 @@ mod tests {
 
     let path = registry::dir().join("cl_err.csv");
     fs::write(&path, "a,b\n1,2\n").unwrap();
-    let pushed = push_file(&[name.to_string()], &path).map(|push| push.failed);
+    let pushed = push_file(&[(name.to_string(), false)], &path).map(|push| push.failed);
     fs::remove_file(&path).unwrap();
     assert_eq!(pushed, Ok(true));
     server.join().unwrap();
@@ -1449,5 +1492,162 @@ mod tests {
       vec![vec![rows(&["t,v"]), rows(&["0,1"]), rows(&["2,3"])]]
     );
     registry::remove_entry("by_ok");
+  }
+
+  #[test]
+  fn frames_start_a_single_plots_file_and_blank_lines_go_through() {
+    registry::init_test_dir();
+    let name = "frs_one";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token = register(name, &listener);
+    let server = fake_chunks(listener, name, &token, 2, None);
+    let path = registry::dir().join("frs_one.csv");
+    fs::write(&path, "t,v\n0,1\n\n1,2\n").unwrap();
+    let cli = single(&["--frames", name, path.to_str().unwrap()]);
+
+    let result = execute(&cli);
+    fs::remove_file(&path).unwrap();
+    let chunks = server.join().unwrap();
+    assert_eq!(result, Ok(false));
+    // The first chunk is the configuration, which carries no rows.
+    assert!(chunks[0].is_empty());
+    assert_eq!(chunks[1][0], Msg::Frames);
+    assert_eq!(rows_of(&chunks[1]), ["t,v", "0,1", "", "1,2"]);
+    registry::remove_entry(name);
+  }
+
+  #[test]
+  fn frames_go_only_to_the_plots_that_asked_for_them() {
+    registry::init_test_dir();
+    let mut servers = Vec::new();
+    for name in ["frm_a", "frm_b"] {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      let token = register(name, &listener);
+      servers.push(fake_chunks(listener, name, &token, 2, None));
+    }
+    let path = registry::dir().join("frm_shared.csv");
+    fs::write(&path, "t,v\n0,1\n\n1,2\n").unwrap();
+    // `--frames` after `frm_a:` is its own option; the shared file goes to both.
+    let (shared, plots) = multi(&[path.to_str().unwrap(), "frm_a:", "--frames", "frm_b:"]);
+
+    let result = execute_multi(&shared, &plots);
+    fs::remove_file(&path).unwrap();
+    let b = servers.remove(1).join().unwrap();
+    let a = servers.remove(0).join().unwrap();
+    assert_eq!(result, Ok(false));
+
+    assert_eq!(a[1][0], Msg::Frames);
+    assert_eq!(rows_of(&a[1]), ["t,v", "0,1", "", "1,2"]);
+    assert!(!b[1].contains(&Msg::Frames));
+    assert_eq!(rows_of(&b[1]), ["t,v", "0,1", "", "1,2"]);
+    registry::remove_entry("frm_a");
+    registry::remove_entry("frm_b");
+  }
+
+  #[test]
+  fn by_with_frames_starts_each_plot_with_frames_and_passes_blank_lines() {
+    registry::init_test_dir();
+    let mut servers = Vec::new();
+    for name in ["byf_a", "byf_b"] {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      let token = register(name, &listener);
+      servers.push(fake_chunks(listener, name, &token, 1, None));
+    }
+    let path = registry::dir().join("byf_frames.csv");
+    fs::write(&path, "t,sensor,v\n0,byf_a,1\n0,byf_b,2\n\n1,byf_a,3\n").unwrap();
+    let cli = single(&["--by", "sensor", "--frames", path.to_str().unwrap()]);
+
+    let result = route_rows(&cli);
+    fs::remove_file(&path).unwrap();
+    let b = servers.remove(1).join().unwrap();
+    let a = servers.remove(0).join().unwrap();
+    assert_eq!(result, Ok(false));
+
+    // byf_b was open when the blank line came, so it ends its frame too.
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0][0], Msg::Frames);
+    assert_eq!(rows_of(&a[0]), ["t,v", "0,1", "", "1,3"]);
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0][0], Msg::Frames);
+    assert_eq!(rows_of(&b[0]), ["t,v", "0,2", ""]);
+    registry::remove_entry("byf_a");
+    registry::remove_entry("byf_b");
+  }
+
+  #[test]
+  fn by_without_frames_ignores_blank_lines() {
+    registry::init_test_dir();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token = register("byn_a", &listener);
+    let server = fake_chunks(listener, "byn_a", &token, 1, None);
+    let path = registry::dir().join("byn_blank.csv");
+    fs::write(&path, "t,sensor,v\n0,byn_a,1\n\n1,byn_a,2\n").unwrap();
+    let cli = single(&["--by", "sensor", path.to_str().unwrap()]);
+
+    let result = route_rows(&cli);
+    fs::remove_file(&path).unwrap();
+    let a = server.join().unwrap();
+    assert_eq!(result, Ok(false));
+
+    assert_eq!(a.len(), 1);
+    assert!(!a[0].contains(&Msg::Frames));
+    assert_eq!(rows_of(&a[0]), ["t,v", "0,1", "1,2"]);
+    registry::remove_entry("byn_a");
+  }
+
+  #[test]
+  fn by_clear_with_names_reaches_every_open_plot_in_order() {
+    registry::init_test_dir();
+    let mut servers = Vec::new();
+    for name in ["byc_a", "byc_b", "byc_c"] {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      let token = register(name, &listener);
+      servers.push(fake_chunks(listener, name, &token, 1, None));
+    }
+    let path = registry::dir().join("byc_clear.csv");
+    // byc_c is opened after the clear, so it gets the new header instead.
+    fs::write(
+      &path,
+      "t,sensor,v\n0,byc_a,1\n0,byc_b,2\n#clear t,sensor,v\n1,byc_a,3\n2,byc_c,4\n",
+    )
+    .unwrap();
+    let cli = single(&["--by", "sensor", path.to_str().unwrap()]);
+
+    let result = route_rows(&cli);
+    fs::remove_file(&path).unwrap();
+    let c = servers.remove(2).join().unwrap();
+    let b = servers.remove(1).join().unwrap();
+    let a = servers.remove(0).join().unwrap();
+    assert_eq!(result, Ok(false));
+
+    assert_eq!(rows_of(&a[0]), ["t,v", "0,1", "#clear t,v", "1,3"]);
+    assert_eq!(rows_of(&b[0]), ["t,v", "0,2", "#clear t,v"]);
+    assert_eq!(rows_of(&c[0]), ["t,v", "2,4"]);
+    registry::remove_entry("byc_a");
+    registry::remove_entry("byc_b");
+    registry::remove_entry("byc_c");
+  }
+
+  #[test]
+  fn by_clear_without_names_sends_the_next_header_to_open_plots() {
+    registry::init_test_dir();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token = register("byh_a", &listener);
+    let server = fake_chunks(listener, "byh_a", &token, 1, None);
+    let path = registry::dir().join("byh_clear.csv");
+    fs::write(
+      &path,
+      "t,sensor,v\n0,byh_a,1\n#clear\nu,sensor,w\n1,byh_a,2\n",
+    )
+    .unwrap();
+    let cli = single(&["--by", "sensor", path.to_str().unwrap()]);
+
+    let result = route_rows(&cli);
+    fs::remove_file(&path).unwrap();
+    let a = server.join().unwrap();
+    assert_eq!(result, Ok(false));
+
+    assert_eq!(rows_of(&a[0]), ["t,v", "0,1", "#clear", "u,w", "1,2"]);
+    registry::remove_entry("byh_a");
   }
 }

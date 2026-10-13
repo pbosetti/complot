@@ -33,6 +33,9 @@ pub enum Msg {
   },
   /// Raw CSV lines, ingested in order as part of this connection's chunk.
   Rows { lines: Vec<String> },
+  /// This connection's CSV comes in frames: a blank line ends a frame, which
+  /// then replaces the plot's data at once. Sent before the first `Rows`.
+  Frames,
   /// Removes all data, keeping the aesthetic and the last header.
   Clear,
   /// Sets the window title.
@@ -102,6 +105,7 @@ mod tests {
       Msg::Rows {
         lines: vec!["1,2".into(), "3,4".into()],
       },
+      Msg::Frames,
       Msg::Clear,
       Msg::Title {
         text: "temp".into(),

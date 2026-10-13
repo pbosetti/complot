@@ -168,6 +168,34 @@ line is a header if none of its fields is a number; a chunk without a header
 reuses the last header the plot has seen. Missing values (`""`, `NA`, `NaN`,
 `null`) are skipped. Quoted fields with embedded separators are not supported.
 
+### Starting over: `#clear`
+
+A line `#clear` in the input clears the plot and restarts parsing as if the
+stream began there: the separator is detected again and the next line may be a
+header. `#clear` followed by column names (`#clear t,temp,pres` or
+`#clear t temp pres`) also sets those names, as a header line would. This makes
+a messy output easy to plot: have the program print `#clear` with the column
+names when its real data starts, and whatever came before is forgotten.
+
+```sh
+./simulate 2>&1 | complot sim -       # simulate prints "#clear t,x,v" after its banner
+```
+
+### Frames: `--frames`
+
+With `--frames`, a blank line ends a frame, and each complete frame replaces
+the previous one in a single swap, with no flicker: a spectrum that is redrawn
+every second, the positions of particles at each step, any output that prints
+its whole state over and over. The last frame is shown at the end of the input
+even without a trailing blank line. Without `--frames`, blank lines are ignored.
+
+```sh
+./particles | complot cloud --frames --aes "x=x y=y" -
+```
+
+Both work with several plots at once: every plot fed by the stream clears or
+swaps, and with `--by`, every plot the stream has reached so far.
+
 ## The window
 
 Drag or scroll to pan, Ctrl/⌘+scroll or pinch to zoom, right-drag to

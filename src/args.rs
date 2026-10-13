@@ -99,6 +99,7 @@ pub fn merged(shared: &Cli, own: &Cli) -> Cli {
     create: own.create || shared.create,
     clear: own.clear || shared.clear,
     close: own.close || shared.close,
+    frames: own.frames || shared.frames,
     title: pick(&own.title, &shared.title),
     by: pick(&own.by, &shared.by),
     list: false,

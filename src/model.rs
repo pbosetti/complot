@@ -136,6 +136,9 @@ pub struct PlotState {
   pub max_points: usize,
   /// Number of rows or values rejected so far.
   pub skipped: u64,
+  /// Points stored by `push_point` so far. `clear` does not reset it, so a
+  /// caller can count its own additions as differences of this value.
+  pub accepted: u64,
   /// Axis labels; empty means none.
   pub x_label: String,
   pub y_label: String,
@@ -199,6 +202,7 @@ impl PlotState {
       s.z.get_or_insert_with(VecDeque::new).push_back(z);
     }
     drop_oldest(s, self.max_points);
+    self.accepted += 1;
     self.version += 1;
     Ok(())
   }
@@ -382,15 +386,43 @@ struct Resolved {
   needed: usize,
 }
 
-/// Per-connection CSV parsing state: separator, header, resolved columns.
+/// A point mapped from a row, not yet pushed to the plot.
+#[derive(Debug)]
+struct RowPoint {
+  series: String,
+  x: Option<f64>,
+  y: f64,
+  z: Option<f64>,
+}
+
+/// Where the points of a row go.
+enum Sink<'a> {
+  /// Straight into the plot.
+  Plot,
+  /// Into the frame being received, shown when the frame ends.
+  Frame(&'a mut Vec<RowPoint>),
+}
+
+/// Per-connection CSV parsing state: separator, header, resolved columns, frames.
 #[derive(Debug, Default)]
 pub struct Chunk {
-  /// Decided by the first non-ignored line; `None` until then.
+  /// Decided by the first non-ignored line; `None` until then. While it is
+  /// `None`, the next non-ignored line is the first one.
   sep: Option<Sep>,
-  /// This chunk's header, if its first non-ignored line was one.
+  /// This chunk's header: from its first non-ignored line, or the names of a
+  /// `#clear` directive. A first line is a header candidate only without it.
   header: Option<Vec<String>>,
   /// Cached column resolution, valid while its `rev` matches `aes_rev`.
   resolved: Option<Resolved>,
+  /// Blank lines end frames while this is set.
+  frames: bool,
+  /// Points of the frame being received, shown when it ends.
+  staged: Vec<RowPoint>,
+  /// `state.skipped` when the frame being received began: the rows rejected
+  /// since then belong to that frame, and are carried across its swap.
+  frame_base: Option<u64>,
+  /// Set by a `#clear` directive, until `take_cleared` reads it.
+  cleared: bool,
 }
 
 impl Chunk {
@@ -401,14 +433,27 @@ impl Chunk {
 
   /// Ingests one CSV line into `state`.
   pub fn ingest(&mut self, state: &mut PlotState, line: &str) -> Result<(), String> {
+    if self.frames && self.frame_base.is_none() {
+      self.frame_base = Some(state.skipped);
+    }
     let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
+    if line.is_empty() {
+      if self.frames {
+        self.end_frame(state);
+      }
+      return Ok(());
+    }
+    if let Some(names) = clear_directive(line) {
+      self.restart(state, names);
+      return Ok(());
+    }
+    if line.starts_with('#') {
       return Ok(());
     }
     let first = self.sep.is_none();
     let sep = *self.sep.get_or_insert_with(|| detect_sep(line));
     let fields = split_fields(line, sep);
-    if first && is_header(&fields) {
+    if first && self.header.is_none() && is_header(&fields) {
       state.header = Some(fields.clone());
       self.header = Some(fields);
       return Ok(());
@@ -439,9 +484,64 @@ impl Chunk {
         }
       }
     };
-    let result = map_row(state, &resolved, &fields, line);
+    let sink = if self.frames {
+      Sink::Frame(&mut self.staged)
+    } else {
+      Sink::Plot
+    };
+    let result = map_row(state, &resolved, &fields, line, sink);
     self.resolved = Some(resolved);
     result
+  }
+
+  /// True if a `#clear` directive was ingested since the last call. Resets the flag.
+  pub fn take_cleared(&mut self) -> bool {
+    std::mem::take(&mut self.cleared)
+  }
+
+  /// Turns frame mode on or off. A frame being received stays staged, and
+  /// is shown by `finish` or by a blank line in frame mode.
+  pub fn set_frames(&mut self, on: bool) {
+    self.frames = on;
+  }
+
+  /// Shows the frame being received, if any. Call it at the end of a connection.
+  pub fn finish(&mut self, state: &mut PlotState) {
+    self.end_frame(state);
+  }
+
+  /// Replaces the plot's data with the staged frame. An empty frame changes nothing.
+  fn end_frame(&mut self, state: &mut PlotState) {
+    // Rows of this frame rejected while it was received; `clear` would lose them.
+    let rejected = state
+      .skipped
+      .saturating_sub(self.frame_base.unwrap_or(state.skipped));
+    if !self.staged.is_empty() {
+      state.clear();
+      state.skipped = rejected;
+      for p in self.staged.drain(..) {
+        // A refused point is counted in `state.skipped`, as any other is.
+        let _ = state.push_point(&p.series, p.x, p.y, p.z);
+      }
+    }
+    self.frame_base = Some(state.skipped);
+  }
+
+  /// Restarts the chunk as if its connection had just begun, after a `#clear`:
+  /// clears the plot and drops the frame being received, then forgets the
+  /// separator, header and column resolution. `names`, if any, become the header.
+  fn restart(&mut self, state: &mut PlotState, names: Vec<String>) {
+    state.clear();
+    self.sep = None;
+    self.header = None;
+    self.resolved = None;
+    self.staged.clear();
+    self.frame_base = None;
+    if !names.is_empty() {
+      state.header = Some(names.clone());
+      self.header = Some(names);
+    }
+    self.cleared = true;
   }
 }
 
@@ -523,6 +623,30 @@ pub(crate) fn split_fields(line: &str, sep: Sep) -> Vec<String> {
     .into_iter()
     .map(|f| unquote(f.trim()).to_string())
     .collect()
+}
+
+/// The names of a trimmed `#clear` directive, or `None` if `line` is not one.
+/// The names follow the keyword, split on commas if there is one, else on
+/// whitespace. `#clearance` and `#clear-all` are comments, not directives.
+fn clear_directive(line: &str) -> Option<Vec<String>> {
+  let rest = line.strip_prefix("#clear")?;
+  if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+    return None;
+  }
+  let rest = rest.trim();
+  let raw: Vec<&str> = if rest.contains(',') {
+    rest.split(',').collect()
+  } else {
+    rest.split_whitespace().collect()
+  };
+  Some(
+    raw
+      .into_iter()
+      .map(|name| unquote(name.trim()))
+      .filter(|name| !name.is_empty())
+      .map(String::from)
+      .collect(),
+  )
 }
 
 /// A chunk's first line is its header iff no field parses as a number.
@@ -625,12 +749,13 @@ fn resolve(aes: &Aes, names: &[String], n: usize, rev: u64) -> Result<Resolved, 
   })
 }
 
-/// Maps one data row to points in `state`. Rejected rows count as skipped.
+/// Maps one data row to points, sent to `sink`. Rejected rows count as skipped.
 fn map_row(
   state: &mut PlotState,
   r: &Resolved,
   fields: &[String],
   line: &str,
+  sink: Sink<'_>,
 ) -> Result<(), String> {
   if fields.len() < r.needed {
     state.skipped += 1;
@@ -697,29 +822,35 @@ fn map_row(
   }
 
   let g = r.g.map(|i| fields[i].as_str());
-  let points: Vec<(String, f64)> = values
+  let points: Vec<RowPoint> = values
     .into_iter()
     .map(|(k, y)| {
       let ycol = &r.y_names[k];
-      let name = match g {
+      let series = match g {
         Some(g) if r.ys.len() > 1 => format!("{g}/{ycol}"),
         Some(g) => g.to_string(),
         None => ycol.clone(),
       };
-      (name, y)
+      RowPoint { series, x, y, z }
     })
     .collect();
-  // Check every series first, so that one refused point rejects the whole row.
-  for (name, y) in &points {
-    if finite_point(x, *y, z)
-      && let Some(reason) = state.reject_reason(name, z.is_some())
-    {
-      state.skipped += 1;
-      return Err(reason);
+  match sink {
+    // A frame is checked when it is shown, so its points are only staged.
+    Sink::Frame(stage) => stage.extend(points),
+    Sink::Plot => {
+      // Check every series first, so that one refused point rejects the whole row.
+      for p in &points {
+        if finite_point(p.x, p.y, p.z)
+          && let Some(reason) = state.reject_reason(&p.series, p.z.is_some())
+        {
+          state.skipped += 1;
+          return Err(reason);
+        }
+      }
+      for p in &points {
+        state.push_point(&p.series, p.x, p.y, p.z)?;
+      }
     }
-  }
-  for (name, y) in &points {
-    state.push_point(name, x, *y, z)?;
   }
   Ok(())
 }
@@ -1498,5 +1629,265 @@ mod tests {
     assert!(state.all_have_z());
     state.push_point("b", None, 1.0, None).unwrap();
     assert!(!state.all_have_z());
+  }
+
+  #[test]
+  fn accepted_counts_stored_points_across_clears() {
+    let mut state = PlotState::new();
+    state.push_point("a", None, 1.0, None).unwrap();
+    state.push_point("a", None, 2.0, None).unwrap();
+    state.push_point("a", None, f64::NAN, None).unwrap();
+    assert_eq!(state.accepted, 2);
+    state.clear();
+    assert_eq!(state.accepted, 2);
+    state.push_point("a", None, 3.0, None).unwrap();
+    assert_eq!(state.accepted, 3);
+  }
+
+  #[test]
+  fn clear_directive_clears_the_data_and_keeps_the_header() {
+    let mut state = PlotState::new();
+    let mut chunk = Chunk::new();
+    for line in ["t,a", "0,1", "#clear", "0,2"] {
+      chunk.ingest(&mut state, line).unwrap();
+    }
+    assert_eq!(names(&state), ["a"]);
+    assert_eq!(points(&state, "a"), [(0.0, 2.0)]);
+    assert_eq!(state.header, Some(vec!["t".to_string(), "a".to_string()]));
+    assert_eq!(state.x_label, "t");
+    assert_eq!(state.skipped, 0);
+  }
+
+  #[test]
+  fn clear_directive_names_set_the_header() {
+    for directive in [
+      "#clear t,v",
+      "#clear t v",
+      "#clear  t ,  v ",
+      "#clear \"t\", \"v\"",
+      "#clear t,,v,",
+      "#clear\tt\tv",
+    ] {
+      let mut state = PlotState::new();
+      let mut chunk = Chunk::new();
+      chunk.ingest(&mut state, directive).unwrap();
+      assert_eq!(
+        state.header,
+        Some(vec!["t".to_string(), "v".to_string()]),
+        "{directive}"
+      );
+      // The next line is data, not a header, even though it has no numbers.
+      assert_eq!(
+        chunk.ingest(&mut state, "a,b").unwrap_err(),
+        "cannot parse x value 'a' in column 't'",
+        "{directive}"
+      );
+      chunk.ingest(&mut state, "0,1").unwrap();
+      assert_eq!(points(&state, "v"), [(0.0, 1.0)], "{directive}");
+    }
+  }
+
+  #[test]
+  fn clear_directive_without_names_detects_a_header_again() {
+    let mut state = PlotState::new();
+    let mut chunk = Chunk::new();
+    for line in ["t,a", "0,1", "#clear", "x,y", "2,3"] {
+      chunk.ingest(&mut state, line).unwrap();
+    }
+    assert_eq!(names(&state), ["y"]);
+    assert_eq!(points(&state, "y"), [(2.0, 3.0)]);
+    assert_eq!(state.x_label, "x");
+    assert_eq!(state.header, Some(vec!["x".to_string(), "y".to_string()]));
+  }
+
+  #[test]
+  fn clear_directive_recovers_from_garbage_that_set_a_wrong_separator() {
+    let mut state = PlotState::new();
+    let mut chunk = Chunk::new();
+    // A log line without commas makes the chunk whitespace-separated.
+    assert!(chunk.ingest(&mut state, "Starting run 42").is_err());
+    chunk.ingest(&mut state, "#clear t,v").unwrap();
+    chunk.ingest(&mut state, "0,1").unwrap();
+    chunk.ingest(&mut state, "1,2").unwrap();
+    assert_eq!(names(&state), ["v"]);
+    assert_eq!(points(&state, "v"), [(0.0, 1.0), (1.0, 2.0)]);
+    assert_eq!(state.skipped, 0);
+  }
+
+  #[test]
+  fn without_the_directive_the_same_lines_misparse() {
+    let mut state = PlotState::new();
+    let mut chunk = Chunk::new();
+    assert!(chunk.ingest(&mut state, "Starting run 42").is_err());
+    // Whitespace-separated, and with the cached columns of the first line.
+    assert_eq!(
+      chunk.ingest(&mut state, "0,1").unwrap_err(),
+      "row has 1 fields, expected at least 3: '0,1'"
+    );
+    assert!(chunk.ingest(&mut state, "1,2").is_err());
+    assert!(names(&state).is_empty());
+    assert_eq!(state.skipped, 3);
+  }
+
+  #[test]
+  fn clear_directive_forgets_the_column_resolution() {
+    let mut state = PlotState::new();
+    let mut chunk = Chunk::new();
+    for line in ["t,a", "0,1", "#clear v,t", "5,0"] {
+      chunk.ingest(&mut state, line).unwrap();
+    }
+    // The same column indices, but the second column is now named 't'.
+    assert_eq!(names(&state), ["t"]);
+    assert_eq!(points(&state, "t"), [(5.0, 0.0)]);
+  }
+
+  #[test]
+  fn clearance_and_clear_all_are_comments() {
+    let mut state = PlotState::new();
+    feed(
+      &mut state,
+      &["t,a", "0,1", "#clearance", "#clear-all", "1,2"],
+    );
+    assert_eq!(points(&state, "a"), [(0.0, 1.0), (1.0, 2.0)]);
+    assert_eq!(state.header, Some(vec!["t".to_string(), "a".to_string()]));
+  }
+
+  #[test]
+  fn take_cleared_reports_each_directive_once() {
+    let mut state = PlotState::new();
+    let mut chunk = Chunk::new();
+    chunk.ingest(&mut state, "t,a").unwrap();
+    assert!(!chunk.take_cleared());
+    chunk.ingest(&mut state, "#clear").unwrap();
+    assert!(chunk.take_cleared());
+    assert!(!chunk.take_cleared());
+  }
+
+  /// A chunk in frame mode.
+  fn framed() -> Chunk {
+    let mut chunk = Chunk::new();
+    chunk.set_frames(true);
+    chunk
+  }
+
+  #[test]
+  fn frame_rows_are_shown_at_the_blank_line() {
+    let mut state = PlotState::new();
+    let mut chunk = framed();
+    for line in ["t,v", "0,1", "1,2"] {
+      chunk.ingest(&mut state, line).unwrap();
+    }
+    assert!(state.series.is_empty());
+    chunk.ingest(&mut state, "").unwrap();
+    assert_eq!(points(&state, "v"), [(0.0, 1.0), (1.0, 2.0)]);
+    assert_eq!(state.skipped, 0);
+  }
+
+  #[test]
+  fn a_second_frame_replaces_the_first() {
+    let mut state = PlotState::new();
+    let mut chunk = framed();
+    for line in ["t,v", "0,1", "1,2", "", "5,9", ""] {
+      chunk.ingest(&mut state, line).unwrap();
+    }
+    assert_eq!(names(&state), ["v"]);
+    assert_eq!(points(&state, "v"), [(5.0, 9.0)]);
+  }
+
+  #[test]
+  fn finish_shows_the_last_frame() {
+    let mut state = PlotState::new();
+    let mut chunk = framed();
+    for line in ["t,v", "0,1", "", "0,7"] {
+      chunk.ingest(&mut state, line).unwrap();
+    }
+    assert_eq!(points(&state, "v"), [(0.0, 1.0)]);
+    chunk.finish(&mut state);
+    assert_eq!(points(&state, "v"), [(0.0, 7.0)]);
+    // With nothing staged, finish changes nothing.
+    let version = state.version;
+    chunk.finish(&mut state);
+    assert_eq!(state.version, version);
+  }
+
+  #[test]
+  fn an_empty_frame_keeps_the_previous_one() {
+    let mut state = PlotState::new();
+    let mut chunk = framed();
+    for line in ["t,v", "0,1", "", ""] {
+      chunk.ingest(&mut state, line).unwrap();
+    }
+    assert_eq!(points(&state, "v"), [(0.0, 1.0)]);
+  }
+
+  #[test]
+  fn frame_rejects_are_counted_with_the_frame_they_belong_to() {
+    let mut state = PlotState::new();
+    let mut chunk = Chunk::new();
+    chunk.set_frames(true);
+    for line in [
+      "t,v", "0,1", "1,oops", "", "0,2", "1,3", "2,bad", "3,worse", "",
+    ] {
+      let _ = chunk.ingest(&mut state, line);
+    }
+    // The frame on display is the second one, with its two rejected rows.
+    assert_eq!(state.total_points(), 2);
+    assert_eq!(state.skipped, 2);
+    // An empty frame keeps the frame on display and its count.
+    let _ = chunk.ingest(&mut state, "");
+    assert_eq!(state.skipped, 2);
+  }
+
+  #[test]
+  fn clear_directive_in_a_frame_drops_the_staged_rows() {
+    let mut state = PlotState::new();
+    let mut chunk = framed();
+    for line in ["t,v", "0,1", "", "5,5", "#clear t,v", "1,2"] {
+      chunk.ingest(&mut state, line).unwrap();
+    }
+    // The directive cleared the plot at once, and the staged 5,5 is gone.
+    assert!(state.series.is_empty());
+    chunk.ingest(&mut state, "").unwrap();
+    assert_eq!(points(&state, "v"), [(1.0, 2.0)]);
+  }
+
+  #[test]
+  fn implicit_x_restarts_in_each_frame() {
+    let mut state = PlotState::new();
+    let mut chunk = framed();
+    for line in ["v", "5", "6", "", "7", ""] {
+      chunk.ingest(&mut state, line).unwrap();
+    }
+    assert_eq!(points(&state, "v"), [(0.0, 7.0)]);
+  }
+
+  #[test]
+  fn refused_frame_points_are_counted_when_the_frame_is_shown() {
+    let mut state = PlotState::new();
+    let mut chunk = framed();
+    for line in ["t,v", "0,1", "1,inf", ""] {
+      chunk.ingest(&mut state, line).unwrap();
+    }
+    assert_eq!(points(&state, "v"), [(0.0, 1.0)]);
+    assert_eq!(state.skipped, 1);
+  }
+
+  #[test]
+  fn a_3d_frame_without_z_is_refused_at_the_blank_line() {
+    let mut state = PlotState::new();
+    state.set_type(PlotType::Points3d, None).unwrap();
+    let mut chunk = framed();
+    for line in ["t,v", "0,1", ""] {
+      chunk.ingest(&mut state, line).unwrap();
+    }
+    assert!(state.series.is_empty());
+    assert_eq!(state.skipped, 1);
+  }
+
+  #[test]
+  fn blank_lines_are_ignored_without_frames() {
+    let mut state = PlotState::new();
+    feed(&mut state, &["t,v", "0,1", "", "1,2", ""]);
+    assert_eq!(points(&state, "v"), [(0.0, 1.0), (1.0, 2.0)]);
   }
 }

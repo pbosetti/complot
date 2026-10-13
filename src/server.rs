@@ -152,8 +152,13 @@ pub fn handle_connection<R: BufRead, W: Write>(
       Msg::Rows { lines } => {
         let batch = ingest_lines(state, &mut chunk, &lines);
         repaint();
+        if batch.cleared {
+          // The summary counts only the rows after the last `#clear`.
+          rejected = 0;
+          added = 0;
+        }
         added += batch.added;
-        // Only the first rejection of the connection is reported at once.
+        // Only the first rejection since the last `#clear` is reported at once.
         if rejected == 0
           && let Some(e) = &batch.first_error
         {
@@ -164,9 +169,9 @@ pub fn handle_connection<R: BufRead, W: Write>(
       Msg::Point { x, y, z, g } => {
         let result = {
           let mut st = lock(state);
-          let before = accepted_so_far(&st);
+          let before = st.accepted;
           let result = st.push_point(g.as_deref().unwrap_or("y"), x, y, z);
-          added += (accepted_so_far(&st) - before) as u64;
+          added += st.accepted - before;
           if st.x_label.is_empty() {
             let label = if x.is_none() { "index" } else { "x" };
             st.x_label = label.to_string();
@@ -192,6 +197,7 @@ pub fn handle_connection<R: BufRead, W: Write>(
         lock(state).title = Some(text);
         repaint();
       }
+      Msg::Frames => chunk.set_frames(true),
       Msg::Clear => {
         lock(state).clear();
         repaint();
@@ -214,6 +220,18 @@ pub fn handle_connection<R: BufRead, W: Write>(
     }
   }
 
+  // A frame still open at the end of the stream is shown now.
+  let changed = {
+    let mut st = lock(state);
+    let (before, version) = (st.accepted, st.version);
+    chunk.finish(&mut st);
+    added += st.accepted - before;
+    st.version != version
+  };
+  if changed {
+    repaint();
+  }
+
   if rejected > 0 {
     if added == 0 {
       reply(
@@ -227,36 +245,39 @@ pub fn handle_connection<R: BufRead, W: Write>(
   Ok(())
 }
 
-/// What one `Rows` message did to the plot.
+/// What one `Rows` message did to the plot. The counts start after the last
+/// `#clear` in the message, if there is one.
+#[derive(Default)]
 struct Batch {
   added: u64,
   rejected: u64,
-  /// Message of the first rejected line.
+  /// Message of the first rejected line since the last `#clear`.
   first_error: Option<String>,
+  /// True if the message had a `#clear`.
+  cleared: bool,
 }
 
 /// Ingests `lines` into the plot under a single lock.
 fn ingest_lines(state: &Mutex<PlotState>, chunk: &mut Chunk, lines: &[String]) -> Batch {
   let mut st = lock(state);
-  let before = accepted_so_far(&st);
-  let mut batch = Batch {
-    added: 0,
-    rejected: 0,
-    first_error: None,
-  };
+  let mut batch = Batch::default();
   for line in lines {
-    if let Err(e) = chunk.ingest(&mut st, line) {
+    let before = st.accepted;
+    let result = chunk.ingest(&mut st, line);
+    if chunk.take_cleared() {
+      batch = Batch {
+        cleared: true,
+        ..Batch::default()
+      };
+      continue;
+    }
+    batch.added += st.accepted - before;
+    if let Err(e) = result {
       batch.rejected += 1;
       batch.first_error.get_or_insert(e);
     }
   }
-  batch.added = (accepted_so_far(&st) - before) as u64;
   batch
-}
-
-/// Total of the series' next sample indices. It grows by one per accepted point.
-fn accepted_so_far(st: &PlotState) -> f64 {
-  st.series.iter().map(|s| s.next_index).sum()
 }
 
 /// Writes one reply line and flushes it. Errors are ignored: the client may be gone.
@@ -275,7 +296,7 @@ fn lock(state: &Mutex<PlotState>) -> MutexGuard<'_, PlotState> {
 mod tests {
   use super::*;
   use crate::model::{Aes, Geom, Kind, PlotType};
-  use std::cell::Cell;
+  use std::cell::{Cell, RefCell};
   use std::io::Read;
   use std::net::Shutdown;
 
@@ -829,5 +850,91 @@ mod tests {
       "complot ok plot1\nerror: series 'a' has no z values; this point has one\n"
     );
     assert_eq!(points(&state, "a"), Some(vec![(0.0, 1.0)]));
+  }
+
+  #[test]
+  fn frames_show_at_blank_lines_and_the_last_one_at_eof() {
+    let state = Mutex::new(PlotState::new());
+    let shown = RefCell::new(Vec::new());
+    // Records the plot after every repaint, i.e. after each message.
+    let repaint = || shown.borrow_mut().push(points(&state, "v"));
+    let mut out = Vec::new();
+    handle_connection(
+      io::Cursor::new(session(&[
+        Msg::Frames,
+        rows(&["t,v", "0,1", ""]),
+        rows(&["0,5"]),
+      ])),
+      &mut out,
+      &state,
+      TOKEN,
+      NAME,
+      &repaint,
+    )
+    .unwrap();
+    assert_eq!(String::from_utf8(out).unwrap(), "complot ok plot1\n");
+    assert_eq!(
+      shown.into_inner(),
+      [
+        Some(vec![(0.0, 1.0)]),
+        Some(vec![(0.0, 1.0)]),
+        Some(vec![(0.0, 5.0)]),
+      ]
+    );
+  }
+
+  #[test]
+  fn points_shown_at_frame_ends_count_as_added() {
+    let state = Mutex::new(PlotState::new());
+    let (out, _) = drive(
+      &state,
+      session(&[Msg::Frames, rows(&["t,v", "x,2", "0,1", "", "0,5"])]),
+    );
+    // Two frames were shown, so the rejected row is not "no data plotted".
+    assert_eq!(
+      out,
+      "complot ok plot1\n\
+       warn: cannot parse x value 'x' in column 't'\n\
+       warn: 1 rows rejected\n"
+    );
+    assert_eq!(points(&state, "v"), Some(vec![(0.0, 5.0)]));
+  }
+
+  #[test]
+  fn clear_directive_resets_the_summary_counters() {
+    let state = Mutex::new(PlotState::new());
+    let (out, _) = drive(
+      &state,
+      session(&[rows(&[
+        "Starting run 42",
+        "Starting run 43",
+        "#clear t,v",
+        "0,1",
+        "1,2",
+      ])]),
+    );
+    assert_eq!(out, "complot ok plot1\n");
+    assert_eq!(points(&state, "v"), Some(vec![(0.0, 1.0), (1.0, 2.0)]));
+  }
+
+  #[test]
+  fn clear_directive_in_a_later_message_resets_the_summary_counters() {
+    let state = Mutex::new(PlotState::new());
+    let (out, _) = drive(
+      &state,
+      session(&[
+        rows(&["Starting run 42"]),
+        rows(&["#clear t,v", "0,1", "x,2"]),
+      ]),
+    );
+    // Only the rows after the `#clear` are counted: one rejected, and data plotted.
+    assert_eq!(
+      out,
+      "complot ok plot1\n\
+       warn: cannot parse x value 'Starting' in column '1'\n\
+       warn: cannot parse x value 'x' in column 't'\n\
+       warn: 1 rows rejected\n"
+    );
+    assert_eq!(points(&state, "v"), Some(vec![(0.0, 1.0)]));
   }
 }

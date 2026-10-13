@@ -95,6 +95,10 @@ pub struct Cli {
   #[arg(long, value_name = "COL")]
   pub by: Option<String>,
 
+  /// Read CSV input as frames: a blank line ends a frame, which replaces the plot's data.
+  #[arg(long)]
+  pub frames: bool,
+
   /// List open plots.
   #[arg(short = 'l', long, exclusive = true)]
   pub list: bool,
