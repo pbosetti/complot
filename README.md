@@ -30,6 +30,8 @@ the version; `complot --version` adds the build target. Maintainers: see
 ```
 complot [NAME] [FILES...] [--aes SPEC] [-x X] [-y Y] [-z Z] [-g GROUP]
         [-t TYPE] [--create] [--clear] [--close] [--title TEXT]
+complot [SHARED...] NAME: [ARGS...] [NAME: [ARGS...]]...
+complot --by COL [--create] [OPTIONS] FILES...
 complot --list
 complot --list-types
 complot --close-all
@@ -45,6 +47,8 @@ complot --close-all
 | `--aes "x=c1 y=c2 g=c3"` | Sets the aesthetic mapping; it is kept by the plot for later chunks. |
 | `--create` / `-c` | Opens the plot if needed when pushing data. |
 | `--clear`, `--close`, `--title T` | Clears the data, closes the window, sets the title. |
+| `NAME: … NAME: …` | Several plots in one call (see below). |
+| `--by COL` | Sends each CSV row to the plot named in column COL (see below). |
 | `--list` / `-l` | Lists the open plots. |
 | `--list-types` | Lists the plot types. |
 | `--close-all` | Closes every open plot. |
@@ -56,6 +60,40 @@ loop stops when you close its window:
 h=$(complot)
 while sleep 0.2; do complot $h -y $RANDOM || break; done
 ```
+
+## Several plots at once
+
+Put a colon after a plot name to start its part of the command line. Options
+and files before the first `NAME:` are shared by every plot; a plot's own
+options override them. With `NAME:` parts, every other positional is a file.
+
+```sh
+complot -x $t temp: -y $T pres: -y $P              # a shared x, a y for each plot
+complot temp: a.csv pres: b.csv                    # a file for each plot
+tail -f log.csv | complot - temp: --aes "x=t y=temp" \
+                            pres: --aes "x=t y=pres"
+```
+
+The last line reads the stream once and sends it to both plots; each plot
+picks its own columns with its own aesthetic. Without any `NAME:`, the command
+line works as before (`complot temp -y 1`).
+
+`--by COL` routes rows instead: each CSV row goes to the plot named by its
+value in column COL (a header name or a 1-based index), and that column is left
+out of the forwarded row. Each plot gets the chunk's header first.
+
+```sh
+sensor_log | complot --by sensor --create --aes "x=t y=v" -
+while sleep 0.1; do
+  echo "cpu,$(date +%s),$(cpu_load)"
+  echo "mem,$(date +%s),$(mem_used)"
+done | complot --by 1 --create -                    # one process for the whole loop
+```
+
+With `--create`, a plot is opened the first time its name appears, with the
+other options of the command line (aesthetic, type, title). Without it,
+naming a plot that is not open is an error and its rows are skipped. A plot
+whose window is closed during the stream is not reopened.
 
 ## Aesthetics
 

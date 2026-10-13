@@ -1,10 +1,13 @@
 //! Client side: connecting to plot servers, spawning them, pushing data.
 
 use crate::Cli;
+use crate::args::{self, Invocation};
 use crate::model::{Aes, PlotType};
 use crate::protocol::{self, ERROR, GREETING, Msg};
 use crate::registry;
+use crate::route::{Routed, Router};
 use clap::ValueEnum;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -254,21 +257,63 @@ fn read_error(path: &Path, e: io::Error) -> String {
   format!("cannot read '{}': {e}", path.display())
 }
 
-/// Pushes the lines of `path` (`-` for stdin) over a connection of their own,
-/// so each file is one CSV chunk. Returns true if the server reported an error.
-fn push_file(name: &str, path: &Path) -> Result<bool, String> {
+/// Opens a CSV source (`-` for stdin) with a read buffer.
+fn open_source(path: &Path) -> Result<BufReader<Box<dyn Read>>, String> {
   let source: Box<dyn Read> = if path == Path::new("-") {
     Box::new(io::stdin())
   } else {
     Box::new(File::open(path).map_err(|e| read_error(path, e))?)
   };
-  let mut lines = BufReader::with_capacity(READ_BUFFER, source);
-  let conn = connect(name).map_err(|e| connect_error(name, e))?;
-  let mut session = Session::open(name, conn);
+  Ok(BufReader::with_capacity(READ_BUFFER, source))
+}
+
+/// Removes the line break that ends `raw`: a `\n`, then a `\r`.
+fn strip_newline(raw: &mut Vec<u8>) {
+  if raw.last() == Some(&b'\n') {
+    raw.pop();
+  }
+  if raw.last() == Some(&b'\r') {
+    raw.pop();
+  }
+}
+
+/// What pushing one source did.
+#[derive(Debug, Default)]
+struct Push {
+  /// The server reported an error, or a plot was lost.
+  failed: bool,
+  /// The plots that were lost: their windows closed, or they could not be reached.
+  closed: Vec<String>,
+}
+
+impl Push {
+  /// Reports that `plot` gets nothing more from this source.
+  fn lose(&mut self, plot: &str, msg: String) {
+    eprintln!("complot: {msg}");
+    self.failed = true;
+    self.closed.push(plot.to_string());
+  }
+}
+
+/// Pushes the lines of `path` (`-` for stdin) to every plot in `plots`, each
+/// over a connection of its own, so that each file is one CSV chunk per plot.
+/// The source is read once, and each batch goes to every plot still open. A
+/// plot that is lost is reported and dropped; the others go on, and the
+/// source is not read any further once none is left.
+fn push_file(plots: &[String], path: &Path) -> Result<Push, String> {
+  let mut lines = open_source(path)?;
+  let mut push = Push::default();
+  let mut sessions = Vec::new();
+  for plot in plots {
+    match connect(plot) {
+      Ok(conn) => sessions.push(Session::open(plot, conn)),
+      Err(e) => push.lose(plot, connect_error(plot, e)),
+    }
+  }
 
   let mut batch = Vec::new();
   let mut raw = Vec::new();
-  loop {
+  while !sessions.is_empty() {
     raw.clear();
     if lines
       .read_until(b'\n', &mut raw)
@@ -277,25 +322,41 @@ fn push_file(name: &str, path: &Path) -> Result<bool, String> {
     {
       break;
     }
-    if raw.last() == Some(&b'\n') {
-      raw.pop();
-    }
-    if raw.last() == Some(&b'\r') {
-      raw.pop();
-    }
+    strip_newline(&mut raw);
     batch.push(String::from_utf8_lossy(&raw).into_owned());
     // Send now if the next read would block (no complete line is buffered),
     // so that a live stream such as `tail -f` is shown in real time.
     if batch.len() >= BATCH_LINES || !lines.buffer().contains(&b'\n') {
-      session.send(&Msg::Rows {
-        lines: std::mem::take(&mut batch),
-      })?;
+      fan_out(&mut sessions, &batch, &mut push);
+      batch.clear();
     }
   }
   if !batch.is_empty() {
-    session.send(&Msg::Rows { lines: batch })?;
+    fan_out(&mut sessions, &batch, &mut push);
   }
-  session.finish()
+  for session in sessions {
+    let plot = session.name.clone();
+    match session.finish() {
+      Ok(failed) => push.failed |= failed,
+      Err(msg) => push.lose(&plot, msg),
+    }
+  }
+  Ok(push)
+}
+
+/// Sends `batch` to every session. A session whose send fails is dropped.
+fn fan_out(sessions: &mut Vec<Session>, batch: &[String], push: &mut Push) {
+  sessions.retain_mut(|session| {
+    match session.send(&Msg::Rows {
+      lines: batch.to_vec(),
+    }) {
+      Ok(()) => true,
+      Err(msg) => {
+        push.lose(&session.name, msg);
+        false
+      }
+    }
+  });
 }
 
 /// The `--list-types` text: one line per plot type, with its name and help.
@@ -311,8 +372,13 @@ fn types_text() -> String {
 }
 
 /// Runs a client invocation; never called with `--serve`.
-pub fn run(cli: &Cli) -> ExitCode {
-  match execute(cli) {
+pub fn run(inv: &Invocation) -> ExitCode {
+  let result = match inv {
+    Invocation::Single(cli) if cli.by.is_some() => route_rows(cli),
+    Invocation::Single(cli) => execute(cli),
+    Invocation::Multi { shared, plots } => execute_multi(shared, plots),
+  };
+  match result {
     Ok(false) => ExitCode::SUCCESS,
     Ok(true) => ExitCode::FAILURE,
     Err(msg) => {
@@ -322,7 +388,7 @@ pub fn run(cli: &Cli) -> ExitCode {
   }
 }
 
-/// Does the work of [`run`]. `Ok(true)` if the server reported an error.
+/// Does the work of [`run`] for one plot. `Ok(true)` if the server reported an error.
 fn execute(cli: &Cli) -> Result<bool, String> {
   if cli.list {
     for name in registry::names() {
@@ -352,6 +418,42 @@ fn execute(cli: &Cli) -> Result<bool, String> {
   if !registry::valid_name(&name) {
     return Err(format!("invalid plot name '{name}'"));
   }
+  check_options(cli)?;
+  let aes = parse_aes(cli)?;
+
+  let first = match connect(&name) {
+    Ok(conn) => conn,
+    Err(ConnectError::Failed(msg)) => return Err(msg),
+    Err(ConnectError::NotRunning) if cli.close => return Ok(false),
+    Err(ConnectError::NotRunning) if has_data && !cli.create => {
+      return Err(missing_error(&[name.as_str()]));
+    }
+    Err(ConnectError::NotRunning) => start(&name)?,
+  };
+
+  let mut failed = send_all(&name, first, &setup_messages(cli, aes.as_ref(), true))?;
+  for path in &cli.files {
+    let push = push_file(std::slice::from_ref(&name), path)?;
+    failed |= push.failed;
+    if !push.closed.is_empty() {
+      // The window is gone: nothing more to send, not even `--close`.
+      return Ok(true);
+    }
+  }
+  if cli.close {
+    let conn = connect(&name).map_err(|e| connect_error(&name, e))?;
+    failed |= close(&name, conn)?;
+  }
+
+  if !has_data && !cli.close {
+    // The handle, for `h=$(complot)`.
+    let _ = writeln!(io::stdout(), "{name}");
+  }
+  Ok(failed)
+}
+
+/// Checks the options that place a point.
+fn check_options(cli: &Cli) -> Result<(), String> {
   // Non-finite numbers have no JSON encoding.
   if [cli.x, cli.y, cli.z]
     .iter()
@@ -363,70 +465,436 @@ fn execute(cli: &Cli) -> Result<bool, String> {
   if cli.g.is_some() && cli.y.is_none() && cli.plot_type.is_none() {
     return Err("-g needs -y (a point) or -t (the group's type)".into());
   }
-  let aes = cli
+  Ok(())
+}
+
+/// The `--aes` of `cli`, parsed.
+fn parse_aes(cli: &Cli) -> Result<Option<Aes>, String> {
+  cli
     .aes
     .as_deref()
     .map(Aes::parse)
     .transpose()
-    .map_err(|e| format!("invalid --aes: {e}"))?;
+    .map_err(|e| format!("invalid --aes: {e}"))
+}
 
-  let first = match connect(&name) {
-    Ok(conn) => conn,
-    Err(ConnectError::Failed(msg)) => return Err(msg),
-    Err(ConnectError::NotRunning) if cli.close => return Ok(false),
-    Err(ConnectError::NotRunning) if has_data && !cli.create => {
-      return Err(format!(
-        "plot '{name}' is not open (create it with `complot {name}` or pass --create)"
-      ));
-    }
-    Err(ConnectError::NotRunning) => {
-      spawn(&name)?;
-      connect(&name).map_err(|e| connect_error(&name, e))?
-    }
-  };
-
-  let mut failed = false;
-  let mut session = Session::open(&name, first);
+/// The messages that set a plot up: aesthetic, title, clear and type, then
+/// the point of `cli` if `point` is set.
+fn setup_messages(cli: &Cli, aes: Option<&Aes>, point: bool) -> Vec<Msg> {
+  let mut msgs = Vec::new();
   if let Some(aes) = aes {
-    session.send(&Msg::SetAes { aes })?;
+    msgs.push(Msg::SetAes { aes: aes.clone() });
   }
   if let Some(text) = &cli.title {
-    session.send(&Msg::Title { text: text.clone() })?;
+    msgs.push(Msg::Title { text: text.clone() });
   }
   if cli.clear {
-    session.send(&Msg::Clear)?;
+    msgs.push(Msg::Clear);
   }
   // Before the point, so that a new 3D plot accepts it.
   if let Some(plot_type) = cli.plot_type {
-    session.send(&Msg::SetType {
+    msgs.push(Msg::SetType {
       plot_type,
       group: cli.g.clone(),
-    })?;
+    });
   }
-  if let Some(y) = cli.y {
-    session.send(&Msg::Point {
+  if let Some(y) = cli.y
+    && point
+  {
+    msgs.push(Msg::Point {
       x: cli.x,
       y,
       z: cli.z,
       g: cli.g.clone(),
-    })?;
+    });
   }
-  failed |= session.finish()?;
+  msgs
+}
 
-  for path in &cli.files {
-    failed |= push_file(&name, path)?;
+/// Sends `msgs` over `conn` as one chunk. Returns true if the server reported an error.
+fn send_all(name: &str, conn: Connection, msgs: &[Msg]) -> Result<bool, String> {
+  let mut session = Session::open(name, conn);
+  for msg in msgs {
+    session.send(msg)?;
+  }
+  session.finish()
+}
+
+/// Starts the server of `name`, and connects to it.
+fn start(name: &str) -> Result<Connection, String> {
+  spawn(name)?;
+  connect(name).map_err(|e| connect_error(name, e))
+}
+
+/// The error for plots that have data, are not open, and may not be created.
+fn missing_error(names: &[&str]) -> String {
+  match names {
+    [name] => {
+      format!("plot '{name}' is not open (create it with `complot {name}` or pass --create)")
+    }
+    _ => {
+      let list: Vec<String> = names.iter().map(|name| format!("'{name}'")).collect();
+      format!(
+        "plots {} are not open (create them with `complot NAME` or pass --create)",
+        list.join(", ")
+      )
+    }
+  }
+}
+
+/// A plot of a `NAME:` invocation, with its effective options.
+struct Plan {
+  name: String,
+  /// Its own options where given, else the shared ones.
+  cli: Cli,
+  aes: Option<Aes>,
+  /// Has files (its own or shared) or a point, so it is not a handle only.
+  has_data: bool,
+  /// Nothing more is sent to it: it is skipped (not open, with `--close`),
+  /// or its window was closed.
+  gone: bool,
+}
+
+/// How a plot of a `NAME:` invocation gets its connection.
+enum Link {
+  /// Open: the connection to use.
+  Open(Connection),
+  /// Not open, and started now.
+  Spawn,
+  /// Not open, with `--close`: left alone.
+  Skip,
+}
+
+/// Runs a `NAME:` invocation. The shared options apply to every plot, and the
+/// shared files are read once and sent to each plot. `Ok(true)` if a server
+/// reported an error, or a write failed.
+fn execute_multi(shared: &Cli, plots: &[(String, Cli)]) -> Result<bool, String> {
+  // Everything is checked before any plot is touched.
+  let mut plans = Vec::with_capacity(plots.len());
+  for (name, own) in plots {
+    if !registry::valid_name(name) {
+      return Err(format!("invalid plot name '{name}'"));
+    }
+    let cli = args::merged(shared, own);
+    check_options(&cli)?;
+    let aes = parse_aes(&cli)?;
+    let has_data = !shared.files.is_empty() || !cli.files.is_empty() || cli.y.is_some();
+    plans.push(Plan {
+      name: name.clone(),
+      cli,
+      aes,
+      has_data,
+      gone: false,
+    });
   }
 
-  if cli.close {
-    let conn = connect(&name).map_err(|e| connect_error(&name, e))?;
-    failed |= close(&name, conn)?;
+  // Connect to every open plot first. A plot with data that is not open is an
+  // error, reported before anything is started or sent.
+  let mut links = Vec::with_capacity(plans.len());
+  let mut missing = Vec::new();
+  for plan in &plans {
+    links.push(match connect(&plan.name) {
+      Ok(conn) => Link::Open(conn),
+      Err(ConnectError::Failed(msg)) => return Err(msg),
+      Err(ConnectError::NotRunning) if plan.cli.close => Link::Skip,
+      Err(ConnectError::NotRunning) if plan.cli.create || !plan.has_data => Link::Spawn,
+      Err(ConnectError::NotRunning) => {
+        missing.push(plan.name.as_str());
+        Link::Skip
+      }
+    });
+  }
+  if !missing.is_empty() {
+    return Err(missing_error(&missing));
   }
 
-  if !has_data && !cli.close {
-    // The handle, for `h=$(complot)`.
-    let _ = writeln!(io::stdout(), "{name}");
+  let mut conns = Vec::with_capacity(plans.len());
+  for (plan, link) in plans.iter_mut().zip(links) {
+    conns.push(match link {
+      Link::Open(conn) => Some(conn),
+      Link::Spawn => Some(start(&plan.name)?),
+      Link::Skip => {
+        plan.gone = true;
+        None
+      }
+    });
+  }
+
+  // Each plot's first connection: its aesthetic, title, clear, type and point.
+  let mut failed = false;
+  for (plan, conn) in plans.iter_mut().zip(conns) {
+    let Some(conn) = conn else { continue };
+    let msgs = setup_messages(&plan.cli, plan.aes.as_ref(), true);
+    match send_all(&plan.name, conn, &msgs) {
+      Ok(f) => failed |= f,
+      Err(msg) => {
+        eprintln!("complot: {msg}");
+        failed = true;
+        plan.gone = true;
+      }
+    }
+  }
+
+  // Each shared file is read once, and goes to every plot that is still there.
+  for path in &shared.files {
+    let targets: Vec<String> = plans
+      .iter()
+      .filter(|plan| !plan.gone)
+      .map(|plan| plan.name.clone())
+      .collect();
+    if targets.is_empty() {
+      break;
+    }
+    let push = push_file(&targets, path)?;
+    failed |= push.failed;
+    for plan in plans
+      .iter_mut()
+      .filter(|plan| push.closed.contains(&plan.name))
+    {
+      plan.gone = true;
+    }
+  }
+
+  // Each plot's own files go to that plot alone.
+  for plan in plans.iter_mut().filter(|plan| !plan.gone) {
+    for path in &plan.cli.files {
+      let push = push_file(std::slice::from_ref(&plan.name), path)?;
+      failed |= push.failed;
+      if !push.closed.is_empty() {
+        plan.gone = true;
+        break;
+      }
+    }
+  }
+
+  // `--close` comes last, per plot.
+  for plan in plans.iter().filter(|plan| plan.cli.close && !plan.gone) {
+    let result = connect(&plan.name)
+      .map_err(|e| connect_error(&plan.name, e))
+      .and_then(|conn| close(&plan.name, conn));
+    match result {
+      Ok(f) => failed |= f,
+      Err(msg) => {
+        eprintln!("complot: {msg}");
+        failed = true;
+      }
+    }
+  }
+
+  // The handles of the plots that had no data, for `read a b < <(complot a: b:)`.
+  for plan in plans
+    .iter()
+    .filter(|plan| !plan.has_data && !plan.cli.close)
+  {
+    // Ignore write errors so that `complot a: b: | head -1` works.
+    let _ = writeln!(io::stdout(), "{}", plan.name);
   }
   Ok(failed)
+}
+
+/// A plot that is being fed the rows of a `--by` source: its connection for
+/// that source, and the rows not sent yet.
+struct Feed {
+  session: Session,
+  batch: Vec<String>,
+}
+
+/// What a `--by` run has done so far, across its sources.
+struct Routing {
+  /// Sent first on each new connection: the shared configuration.
+  setup: Vec<Msg>,
+  /// Opens a plot that is not running.
+  create: bool,
+  /// Plots that are not open, or whose window was closed. Never sent to again.
+  dead: Vec<String>,
+  /// Plots that were routed rows, in order of first use. `--close` closes them.
+  used: Vec<String>,
+  /// The rejection messages printed so far.
+  printed: HashSet<String>,
+  /// Rows rejected, in all.
+  rejected: u64,
+  /// The server reported an error, or a write failed.
+  failed: bool,
+}
+
+impl Routing {
+  fn is_dead(&self, plot: &str) -> bool {
+    self.dead.iter().any(|name| name == plot)
+  }
+
+  /// Prints a rejection the first time its message appears.
+  fn reject(&mut self, msg: String) {
+    self.rejected += 1;
+    if !self.printed.contains(&msg) {
+      eprintln!("complot: warn: {msg}");
+      self.printed.insert(msg);
+    }
+  }
+
+  /// Prints why `plot` gets no more rows, and remembers it for the run.
+  fn drop_plot(&mut self, plot: &str, msg: String) {
+    eprintln!("complot: {msg}");
+    self.failed = true;
+    self.dead.push(plot.to_string());
+  }
+
+  fn use_plot(&mut self, plot: &str) {
+    if !self.used.iter().any(|name| name == plot) {
+      self.used.push(plot.to_string());
+    }
+  }
+}
+
+/// `--by COL`: sends each row of the CSV sources to the plot named by its
+/// value in column COL, without that column. Each source is one chunk, so
+/// every plot it reaches gets a connection of its own for it: the shared
+/// configuration, then the header, then the rows. `Ok(true)` if a server
+/// reported an error, a write failed, or a plot was not open.
+fn route_rows(cli: &Cli) -> Result<bool, String> {
+  if cli.files.is_empty() {
+    return Err("--by needs CSV input (files or -)".into());
+  }
+  check_options(cli)?;
+  let aes = parse_aes(cli)?;
+  let col = cli.by.as_deref().unwrap_or_default();
+  let mut run = Routing {
+    setup: setup_messages(cli, aes.as_ref(), false),
+    create: cli.create,
+    dead: Vec::new(),
+    used: Vec::new(),
+    printed: HashSet::new(),
+    rejected: 0,
+    failed: false,
+  };
+  for path in &cli.files {
+    route_source(&mut run, col, path)?;
+  }
+  if run.rejected > run.printed.len() as u64 {
+    eprintln!("complot: warn: {} rows rejected in all", run.rejected);
+  }
+  if cli.close {
+    let names: Vec<String> = run
+      .used
+      .iter()
+      .filter(|name| !run.is_dead(name))
+      .cloned()
+      .collect();
+    run.failed |= close_plots(&names)?;
+  }
+  Ok(run.failed)
+}
+
+/// Routes the rows of one CSV source (`-` for stdin) on column `col`.
+fn route_source(run: &mut Routing, col: &str, path: &Path) -> Result<(), String> {
+  let mut lines = open_source(path)?;
+  let mut router = Router::new(col);
+  let mut feeds: BTreeMap<String, Feed> = BTreeMap::new();
+  let mut raw = Vec::new();
+  loop {
+    raw.clear();
+    if lines
+      .read_until(b'\n', &mut raw)
+      .map_err(|e| read_error(path, e))?
+      == 0
+    {
+      break;
+    }
+    strip_newline(&mut raw);
+    match router.route(&String::from_utf8_lossy(&raw)) {
+      Routed::Skip | Routed::Header(_) => {}
+      Routed::Reject(msg) => run.reject(msg),
+      Routed::Row { plot, line } => {
+        if !run.is_dead(&plot) {
+          if !feeds.contains_key(&plot)
+            && let Some(feed) = open_feed(run, &plot, router.header())
+          {
+            feeds.insert(plot.clone(), feed);
+          }
+          if let Some(feed) = feeds.get_mut(&plot) {
+            run.use_plot(&plot);
+            // A row that is only the routing column leaves nothing to send.
+            if !line.is_empty() {
+              feed.batch.push(line);
+            }
+          }
+        }
+      }
+    }
+    // The same rule as push_file: send when the next read would block, or
+    // when a batch is full.
+    let full = feeds.values().any(|feed| feed.batch.len() >= BATCH_LINES);
+    if full || !lines.buffer().contains(&b'\n') {
+      flush_feeds(&mut feeds, run);
+    }
+  }
+  flush_feeds(&mut feeds, run);
+  for (plot, feed) in feeds {
+    match feed.session.finish() {
+      Ok(failed) => run.failed |= failed,
+      Err(msg) => run.drop_plot(&plot, msg),
+    }
+  }
+  Ok(())
+}
+
+/// Opens the connection to `plot` for the rows of the current source: the
+/// shared configuration, then the header. `None` if the plot cannot take
+/// rows, which is reported and remembered.
+fn open_feed(run: &mut Routing, plot: &str, header: Option<&str>) -> Option<Feed> {
+  let conn = match connect(plot) {
+    Ok(conn) => conn,
+    Err(ConnectError::NotRunning) if run.create => match start(plot) {
+      Ok(conn) => conn,
+      Err(msg) => {
+        run.drop_plot(plot, msg);
+        return None;
+      }
+    },
+    Err(ConnectError::NotRunning) => {
+      run.drop_plot(plot, format!("plot '{plot}' is not open (pass --create)"));
+      return None;
+    }
+    Err(ConnectError::Failed(msg)) => {
+      run.drop_plot(plot, msg);
+      return None;
+    }
+  };
+  let mut session = Session::open(plot, conn);
+  let header = header.filter(|h| !h.is_empty()).map(|h| Msg::Rows {
+    lines: vec![h.to_string()],
+  });
+  let sent = run
+    .setup
+    .iter()
+    .chain(&header)
+    .try_for_each(|msg| session.send(msg));
+  match sent {
+    Ok(()) => Some(Feed {
+      session,
+      batch: Vec::new(),
+    }),
+    Err(msg) => {
+      run.drop_plot(plot, msg);
+      None
+    }
+  }
+}
+
+/// Sends the rows waiting for each plot. A plot whose window is closed is dropped.
+fn flush_feeds(feeds: &mut BTreeMap<String, Feed>, run: &mut Routing) {
+  feeds.retain(|plot, feed| {
+    if feed.batch.is_empty() {
+      return true;
+    }
+    let lines = std::mem::take(&mut feed.batch);
+    match feed.session.send(&Msg::Rows { lines }) {
+      Ok(()) => true,
+      Err(msg) => {
+        run.drop_plot(plot, msg);
+        false
+      }
+    }
+  });
 }
 
 /// Sends `Close` on `conn`. Returns true if the server reported an error.
@@ -505,6 +973,89 @@ mod tests {
       writer.write_all(trailer.as_bytes()).unwrap();
       msgs
     })
+  }
+
+  /// Serves `chunks` connections on `listener`, each with its own handshake,
+  /// and returns the messages of each one. With `drop_after`, a connection
+  /// that has that many messages is dropped at once, with the client's rest
+  /// unread, and the server stops there: as if its window was closed.
+  fn fake_chunks(
+    listener: TcpListener,
+    name: &str,
+    token: &str,
+    chunks: usize,
+    drop_after: Option<usize>,
+  ) -> JoinHandle<Vec<Vec<Msg>>> {
+    let (name, token) = (name.to_string(), token.to_string());
+    thread::spawn(move || {
+      let mut all = Vec::new();
+      for _ in 0..chunks {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+          .set_read_timeout(Some(Duration::from_secs(5)))
+          .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        assert_eq!(
+          protocol::recv(&mut reader).unwrap(),
+          Some(Msg::Hello {
+            token: token.clone()
+          })
+        );
+        writer
+          .write_all(format!("{GREETING} {name}\n").as_bytes())
+          .unwrap();
+        let mut msgs = Vec::new();
+        while drop_after != Some(msgs.len()) {
+          let Some(msg) = protocol::recv(&mut reader).unwrap() else {
+            break;
+          };
+          msgs.push(msg);
+        }
+        let dropped = drop_after == Some(msgs.len());
+        all.push(msgs);
+        if dropped {
+          // Returning closes the socket with the client's rest unread.
+          return all;
+        }
+      }
+      all
+    })
+  }
+
+  /// The lines of every `Rows` message in `msgs`, in order.
+  fn rows_of(msgs: &[Msg]) -> Vec<String> {
+    msgs
+      .iter()
+      .filter_map(|msg| match msg {
+        Msg::Rows { lines } => Some(lines.clone()),
+        _ => None,
+      })
+      .flatten()
+      .collect()
+  }
+
+  /// A `Rows` message of `lines`.
+  fn rows(lines: &[&str]) -> Msg {
+    Msg::Rows {
+      lines: lines.iter().map(|line| line.to_string()).collect(),
+    }
+  }
+
+  /// Parses a command line that names several plots.
+  fn multi(line: &[&str]) -> (Cli, Vec<(String, Cli)>) {
+    match args::parse(std::iter::once("complot").chain(line.iter().copied())).unwrap() {
+      Invocation::Multi { shared, plots } => (shared, plots),
+      other => panic!("expected several plots, got {other:?}"),
+    }
+  }
+
+  /// Parses a command line that names one plot, or none.
+  fn single(line: &[&str]) -> Cli {
+    match args::parse(std::iter::once("complot").chain(line.iter().copied())).unwrap() {
+      Invocation::Single(cli) => cli,
+      other => panic!("expected one plot, got {other:?}"),
+    }
   }
 
   #[test]
@@ -598,9 +1149,9 @@ mod tests {
       })
       .collect();
     fs::write(&path, text).unwrap();
-    let failed = push_file(name, &path);
+    let pushed = push_file(&[name.to_string()], &path).map(|push| push.failed);
     fs::remove_file(&path).unwrap();
-    assert_eq!(failed, Ok(false));
+    assert_eq!(pushed, Ok(false));
     registry::remove_entry(name);
 
     let batches: Vec<Vec<String>> = server
@@ -654,9 +1205,9 @@ mod tests {
 
     let path = registry::dir().join("cl_err.csv");
     fs::write(&path, "a,b\n1,2\n").unwrap();
-    let failed = push_file(name, &path);
+    let pushed = push_file(&[name.to_string()], &path).map(|push| push.failed);
     fs::remove_file(&path).unwrap();
-    assert_eq!(failed, Ok(true));
+    assert_eq!(pushed, Ok(true));
     server.join().unwrap();
     registry::remove_entry(name);
   }
@@ -724,5 +1275,179 @@ mod tests {
       ]
     );
     registry::remove_entry(name);
+  }
+
+  #[test]
+  fn multi_points_go_to_each_plot_with_the_shared_x() {
+    registry::init_test_dir();
+    let mut servers = Vec::new();
+    for name in ["mp_a", "mp_b"] {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      let token = register(name, &listener);
+      servers.push(fake_chunks(listener, name, &token, 1, None));
+    }
+    let (shared, plots) = multi(&["-x", "3", "mp_a:", "-y", "1", "mp_b:", "-y", "2"]);
+
+    assert_eq!(execute_multi(&shared, &plots), Ok(false));
+    let point = |y: f64| Msg::Point {
+      x: Some(3.0),
+      y,
+      z: None,
+      g: None,
+    };
+    let got: Vec<Vec<Vec<Msg>>> = servers.into_iter().map(|s| s.join().unwrap()).collect();
+    assert_eq!(got, vec![vec![vec![point(1.0)]], vec![vec![point(2.0)]]]);
+    registry::remove_entry("mp_a");
+    registry::remove_entry("mp_b");
+  }
+
+  #[test]
+  fn a_plot_that_is_not_open_stops_the_whole_command() {
+    registry::init_test_dir();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token = register("aon_a", &listener);
+    let server = fake_chunks(listener, "aon_a", &token, 1, None);
+    let (shared, plots) = multi(&["aon_a:", "-y", "1", "aon_missing:", "-y", "2"]);
+
+    let err = execute_multi(&shared, &plots).unwrap_err();
+    assert!(err.starts_with("plot 'aon_missing' is not open"), "{err}");
+    // The connection to aon_a was made, but nothing was sent on it.
+    assert_eq!(server.join().unwrap(), vec![Vec::<Msg>::new()]);
+    registry::remove_entry("aon_a");
+  }
+
+  #[test]
+  fn shared_file_reaches_every_plot_and_own_file_only_its_plot() {
+    registry::init_test_dir();
+    let dir = registry::dir();
+    let shared_path = dir.join("fo_shared.csv");
+    let own_path = dir.join("fo_own.csv");
+    fs::write(&shared_path, "t,v\n0,1\n1,2\n").unwrap();
+    fs::write(&own_path, "t,w\n5,6\n").unwrap();
+    let mut servers = Vec::new();
+    // fo_a: the first connection, the shared file and its own file.
+    // fo_b: the first connection and the shared file.
+    for (name, chunks) in [("fo_a", 3), ("fo_b", 2)] {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      let token = register(name, &listener);
+      servers.push(fake_chunks(listener, name, &token, chunks, None));
+    }
+    let (shared_arg, own_arg) = (shared_path.to_str().unwrap(), own_path.to_str().unwrap());
+    let (shared, plots) = multi(&[shared_arg, "fo_a:", own_arg, "fo_b:"]);
+
+    let result = execute_multi(&shared, &plots);
+    fs::remove_file(&shared_path).unwrap();
+    fs::remove_file(&own_path).unwrap();
+    let b = servers.remove(1).join().unwrap();
+    let a = servers.remove(0).join().unwrap();
+    assert_eq!(result, Ok(false));
+
+    assert_eq!(a.len(), 3);
+    assert!(a[0].is_empty());
+    assert_eq!(rows_of(&a[1]), ["t,v", "0,1", "1,2"]);
+    assert_eq!(rows_of(&a[2]), ["t,w", "5,6"]);
+    assert_eq!(b.len(), 2);
+    assert!(b[0].is_empty());
+    assert_eq!(rows_of(&b[1]), ["t,v", "0,1", "1,2"]);
+    registry::remove_entry("fo_a");
+    registry::remove_entry("fo_b");
+  }
+
+  #[test]
+  fn the_others_get_every_row_when_one_plot_closes() {
+    registry::init_test_dir();
+    let path = registry::dir().join("fc_stream.csv");
+    // About 9 MB, far more than the socket buffers hold, so that the writes to
+    // the plot that has gone must fail while rows are still being sent.
+    let text: String = (0..600_000).map(|i| format!("{i},{}\n", i * 3)).collect();
+    fs::write(&path, &text).unwrap();
+    let mut servers = Vec::new();
+    // fc_a reads one batch and then closes its window.
+    for (name, drop_after) in [("fc_a", Some(1)), ("fc_b", None)] {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      let token = register(name, &listener);
+      servers.push(fake_chunks(listener, name, &token, 2, drop_after));
+    }
+    let (shared, plots) = multi(&[path.to_str().unwrap(), "fc_a:", "fc_b:"]);
+
+    let result = execute_multi(&shared, &plots);
+    fs::remove_file(&path).unwrap();
+    let b = servers.remove(1).join().unwrap();
+    let a = servers.remove(0).join().unwrap();
+    assert_eq!(result, Ok(true));
+
+    assert_eq!(a.len(), 2);
+    assert!(a[0].is_empty());
+    assert_eq!(a[1].len(), 1);
+    assert_eq!(b.len(), 2);
+    let sent = rows_of(&b[1]);
+    assert!(
+      sent.iter().map(String::as_str).eq(text.lines()),
+      "fc_b got {} rows, not {}",
+      sent.len(),
+      text.lines().count()
+    );
+    registry::remove_entry("fc_a");
+    registry::remove_entry("fc_b");
+  }
+
+  #[test]
+  fn by_routes_each_row_to_its_plot_after_the_shared_setup_and_header() {
+    registry::init_test_dir();
+    let mut servers = Vec::new();
+    for name in ["by_a", "by_b"] {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      let token = register(name, &listener);
+      servers.push(fake_chunks(listener, name, &token, 1, None));
+    }
+    let path = registry::dir().join("by_routes.csv");
+    fs::write(&path, "t,sensor,v\n0,by_a,1\n1,by_b,2\n2,by_a,3").unwrap();
+    let cli = single(&["--by", "sensor", "--aes", "x=t y=v", path.to_str().unwrap()]);
+
+    let result = route_rows(&cli);
+    fs::remove_file(&path).unwrap();
+    let b = servers.remove(1).join().unwrap();
+    let a = servers.remove(0).join().unwrap();
+    assert_eq!(result, Ok(false));
+
+    // The file has no final newline, so the rows are sent as they are routed:
+    // "0,1" goes out when the row for by_b is read, and "2,3" at the end.
+    let aes = Msg::SetAes {
+      aes: Aes::parse("x=t y=v").unwrap(),
+    };
+    assert_eq!(
+      a,
+      vec![vec![
+        aes.clone(),
+        rows(&["t,v"]),
+        rows(&["0,1"]),
+        rows(&["2,3"])
+      ]]
+    );
+    assert_eq!(b, vec![vec![aes, rows(&["t,v"]), rows(&["1,2"])]]);
+    registry::remove_entry("by_a");
+    registry::remove_entry("by_b");
+  }
+
+  #[test]
+  fn by_skips_a_plot_that_is_not_open_and_goes_on() {
+    registry::init_test_dir();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token = register("by_ok", &listener);
+    let server = fake_chunks(listener, "by_ok", &token, 1, None);
+    let path = registry::dir().join("by_missing.csv");
+    fs::write(&path, "t,sensor,v\n0,by_ok,1\n1,by_nope,2\n2,by_ok,3").unwrap();
+    let cli = single(&["--by", "sensor", path.to_str().unwrap()]);
+
+    let result = route_rows(&cli);
+    fs::remove_file(&path).unwrap();
+    assert_eq!(result, Ok(true));
+    // As above, the rows go out when the rejected line leaves no complete line
+    // buffered, so "0,1" is a message of its own.
+    assert_eq!(
+      server.join().unwrap(),
+      vec![vec![rows(&["t,v"]), rows(&["0,1"]), rows(&["2,3"])]]
+    );
+    registry::remove_entry("by_ok");
   }
 }

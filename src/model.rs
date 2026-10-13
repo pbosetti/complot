@@ -336,11 +336,31 @@ impl PlotState {
 
 /// Column separator of a chunk, decided by its first line.
 #[derive(Debug, Clone, Copy)]
-enum Sep {
+pub(crate) enum Sep {
   Comma,
   Tab,
   Semicolon,
   Whitespace,
+}
+
+impl Sep {
+  /// Joins `fields` with this separator; a single space for whitespace.
+  pub(crate) fn join<'a>(self, fields: impl IntoIterator<Item = &'a str>) -> String {
+    let text = match self {
+      Sep::Comma => ",",
+      Sep::Tab => "\t",
+      Sep::Semicolon => ";",
+      Sep::Whitespace => " ",
+    };
+    let mut out = String::new();
+    for (i, field) in fields.into_iter().enumerate() {
+      if i > 0 {
+        out.push_str(text);
+      }
+      out.push_str(field);
+    }
+    out
+  }
 }
 
 /// Column indices of the aesthetic mapping, resolved at aes revision `rev`.
@@ -388,7 +408,7 @@ impl Chunk {
     let first = self.sep.is_none();
     let sep = *self.sep.get_or_insert_with(|| detect_sep(line));
     let fields = split_fields(line, sep);
-    if first && fields.iter().all(|f| f.parse::<f64>().is_err()) {
+    if first && is_header(&fields) {
       state.header = Some(fields.clone());
       self.header = Some(fields);
       return Ok(());
@@ -479,7 +499,7 @@ fn y_columns(value: &str) -> Result<Vec<String>, String> {
 }
 
 /// Picks the separator from a line: comma, then tab, then semicolon, else whitespace.
-fn detect_sep(line: &str) -> Sep {
+pub(crate) fn detect_sep(line: &str) -> Sep {
   if line.contains(',') {
     Sep::Comma
   } else if line.contains('\t') {
@@ -492,7 +512,7 @@ fn detect_sep(line: &str) -> Sep {
 }
 
 /// Splits a line into fields, each trimmed with one pair of quotes removed.
-fn split_fields(line: &str, sep: Sep) -> Vec<String> {
+pub(crate) fn split_fields(line: &str, sep: Sep) -> Vec<String> {
   let raw: Vec<&str> = match sep {
     Sep::Comma => line.split(',').collect(),
     Sep::Tab => line.split('\t').collect(),
@@ -503,6 +523,11 @@ fn split_fields(line: &str, sep: Sep) -> Vec<String> {
     .into_iter()
     .map(|f| unquote(f.trim()).to_string())
     .collect()
+}
+
+/// A chunk's first line is its header iff no field parses as a number.
+pub(crate) fn is_header(fields: &[String]) -> bool {
+  fields.iter().all(|f| f.parse::<f64>().is_err())
 }
 
 /// Removes one pair of surrounding double quotes, if present.
@@ -529,7 +554,7 @@ fn column_names(chunk: Option<&[String]>, last: Option<&[String]>, n: usize) -> 
 }
 
 /// Column index of a reference: an exact name first, then a 1-based index.
-fn column_index(names: &[String], n: usize, reference: &str) -> Result<usize, String> {
+pub(crate) fn column_index(names: &[String], n: usize, reference: &str) -> Result<usize, String> {
   if let Some(i) = names.iter().position(|name| name == reference) {
     return Ok(i);
   }

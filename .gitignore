@@ -22,3 +22,6 @@ flamegraph.svg
 # OS files
 .DS_Store
 Thumbs.db
+
+/snaps
+/plans
