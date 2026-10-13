@@ -1,4 +1,16 @@
-# complot
+<p align="center">
+  <img src="assets/banner.svg" alt="complot: real-time plots, straight from the shell" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/pbosetti/complot/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/pbosetti/complot/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/pbosetti/complot/actions/workflows/release.yml"><img alt="Release" src="https://github.com/pbosetti/complot/actions/workflows/release.yml/badge.svg"></a>
+  <a href="https://github.com/pbosetti/complot/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/pbosetti/complot?sort=semver&color=4e79a7"></a>
+  <a href="https://www.rust-lang.org"><img alt="Rust 2024" src="https://img.shields.io/badge/Rust-2024_edition-f28e2b?logo=rust&logoColor=white"></a>
+  <a href="https://github.com/emilk/egui"><img alt="egui" src="https://img.shields.io/badge/GUI-egui-76b7b2"></a>
+  <img alt="macOS, Linux, Windows" src="https://img.shields.io/badge/platform-macOS_%7C_Linux_%7C_Windows-59a14f">
+  <a href="#license"><img alt="License: MIT or Apache-2.0" src="https://img.shields.io/badge/license-MIT_OR_Apache--2.0-e15759"></a>
+</p>
 
 Real-time plots driven from the shell, loosely inspired by the grammar of
 graphics. Every plot is its own window (a small GUI process); short-lived
@@ -22,8 +34,7 @@ complot $h --close
 | From source | `cargo install --git https://github.com/pbosetti/complot` |
 
 Archives for every platform are on the releases page too. `complot -V` prints
-the version; `complot --version` adds the build target. Maintainers: see
-[DEPLOY.md](DEPLOY.md).
+the version; `complot --version` adds the build target.
 
 ## Usage
 
@@ -194,3 +205,11 @@ Plots are registered in a per-user directory (`$XDG_RUNTIME_DIR` or the
 system temp dir, under `complot-$USER`; override with `COMPLOT_DIR`), which
 also holds each plot's log. Clients talk to plots over TCP on 127.0.0.1,
 authenticated with a per-plot random token.
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
+your option.
+
+The banner is drawn from real data (a Lorenz trajectory, Gaussian samples) by
+[`assets/make_banner.py`](assets/make_banner.py).
