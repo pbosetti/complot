@@ -75,6 +75,7 @@ pub fn run(
     .with_app_id("complot");
   let options = eframe::NativeOptions {
     viewport,
+    wgpu_options: wgpu_options(),
     ..Default::default()
   };
   eframe::run_native(
@@ -86,6 +87,22 @@ pub fn run(
     }),
   )
   .map_err(|e| e.to_string())
+}
+
+/// The wgpu setup of the window.
+///
+/// On Windows wgpu prefers Vulkan when a driver is installed, and some
+/// Vulkan drivers or layers crash the process at startup (0xc0000005), so Vulkan is left out there unless `WGPU_BACKEND` asks for it.
+fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+  let mut config = eframe::egui_wgpu::WgpuConfiguration::default();
+  if cfg!(windows)
+    && eframe::wgpu::Backends::from_env().is_none()
+    && let eframe::egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut config.wgpu_setup
+  {
+    create_new.instance_descriptor.backends =
+      eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::GL;
+  }
+  config
 }
 
 /// Where the settings panel was drawn in a frame. The tests check these rects.
