@@ -36,8 +36,11 @@ https://github.com/user-attachments/assets/13c74d11-5448-4ea7-98cc-23b353c450c1
 |---|---|
 | macOS, Linux (Homebrew) | `brew install pbosetti/mads/complot` |
 | Debian, Ubuntu | download the `.deb` from the [releases](https://github.com/pbosetti/complot/releases), then `sudo apt install ./complot_*.deb` |
-| Windows | `winget install pbosetti.complot` |
+| Windows* | `winget install pbosetti.complot` |
 | From source | `cargo install --git https://github.com/pbosetti/complot` |
+
+> * The winget package is still waiting for approval; in the meantime, download the [Windows release](https://github.com/pbosetti/complot/releases), unpack it, and put the executable (single file)  in a directory that is in your PATH.
+
 
 Archives for every platform are on the releases page too. `complot -V` prints
 the version; `complot --version` adds the build target.
