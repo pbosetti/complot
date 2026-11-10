@@ -56,11 +56,11 @@ jobs:
             deb: true
           # Cross-compiled on an arm64 runner, so it is neither tested nor run here.
           - target: x86_64-apple-darwin
-            os: macos-16
+            os: macos-latest
             native: false
             deb: false
           - target: aarch64-apple-darwin
-            os: macos-16
+            os: macos-latest
             native: true
             deb: false
           - target: x86_64-pc-windows-msvc
