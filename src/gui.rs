@@ -7,8 +7,8 @@ use crate::scale::{log_label, log_ticks, to_log};
 use crate::view3d::{Series3d, View3d};
 use eframe::egui;
 use egui_plot::{
-  Bar, BarChart, GridInput, GridMark, HoverPosition, Legend, Line, Plot, PlotPoint, PlotPoints,
-  PlotResponse, PlotUi, Points,
+  Bar, BarChart, Corner, GridInput, GridMark, HoverPosition, Legend, Line, Plot, PlotPoint,
+  PlotPoints, PlotResponse, PlotUi, Points,
 };
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -173,6 +173,8 @@ struct PlotApp {
   point_radius: f32,
   line_width: f32,
   legend: bool,
+  /// Corner of the x–y and histogram legend, chosen in the right-click menu.
+  legend_corner: Corner,
   grid: bool,
   /// Per-series buffer limit shown in the panel, 0 = unlimited.
   max_points: usize,
@@ -604,6 +606,18 @@ fn copy_menu_id() -> egui::Id {
   egui::Id::new("complot_copy_menu")
 }
 
+/// Where a right click inside the plot `response` landed, this frame. The legend rows sense
+/// clicks, so a right click on the legend reaches the plot only through here.
+fn right_click_at(ui: &egui::Ui, response: &egui::Response) -> Option<egui::Pos2> {
+  let at = ui.input(|i| {
+    i.pointer
+      .secondary_clicked()
+      .then(|| i.pointer.interact_pos())
+      .flatten()
+  })?;
+  response.rect.contains(at).then_some(at)
+}
+
 /// `v` as the plot draws it: log10 on a log axis, else `v`. `None` where a log axis has no place
 /// for `v`.
 fn drawn_value(v: f64, log: bool) -> Option<f64> {
@@ -626,48 +640,69 @@ fn sample_at(st: &PlotState, name: &str, at: [f64; 2], logs: [bool; 2]) -> Optio
 /// cursor has none, so it is `10^v` on a log axis. `logs` says which axes are logarithmic.
 fn copy_snapshot<R>(
   response: &PlotResponse<R>,
+  at: egui::Pos2,
   st: &PlotState,
   snapped: Option<(String, [f64; 2])>,
   logs: [bool; 2],
-) -> Option<CopyMenu> {
-  let at = response.response.hover_pos()?;
+) -> CopyMenu {
   let cursor = response.transform.value_from_position(at);
   let point = snapped.map(|(series, drawn)| {
     let [x, y] = sample_at(st, &series, drawn, logs)
       .unwrap_or([unlog(drawn[0], logs[0]), unlog(drawn[1], logs[1])]);
     (series, [x, y])
   });
-  Some(CopyMenu {
+  CopyMenu {
     at,
     point,
     cursor: [unlog(cursor.x, logs[0]), unlog(cursor.y, logs[1])],
-  })
+  }
 }
 
 /// Shows the copy menu `menu` over the plot `response`, while it is open. Returns the text of the
 /// button clicked, if one was: "x,y" at full precision.
-fn copy_menu_items(response: &egui::Response, menu: &CopyMenu) -> Option<String> {
+fn copy_menu_items(
+  response: &egui::Response,
+  menu: &CopyMenu,
+  open: bool,
+  legend: &mut bool,
+  corner: &mut Corner,
+) -> Option<String> {
   let mut copied = None;
-  egui::Popup::context_menu(response)
-    .id(copy_menu_id())
-    .show(|ui| {
-      if let Some((series, [x, y])) = &menu.point
-        && ui
-          .button(format!("Copy point  {series}: {}, {}", sig4(*x), sig4(*y)))
-          .clicked()
-      {
-        copied = Some(format!("{x},{y}"));
-        ui.close();
-      }
-      let [x, y] = menu.cursor;
-      if ui
-        .button(format!("Copy cursor  {}, {}", sig4(x), sig4(y)))
+  let mut popup = egui::Popup::context_menu(response).id(copy_menu_id());
+  if open {
+    // A right click on the legend, which the plot response misses.
+    popup = popup.open_memory(egui::SetOpenCommand::Bool(true));
+  }
+  popup.show(|ui| {
+    if let Some((series, [x, y])) = &menu.point
+      && ui
+        .button(format!("Copy point  {series}: {}, {}", sig4(*x), sig4(*y)))
         .clicked()
-      {
-        copied = Some(format!("{x},{y}"));
-        ui.close();
+    {
+      copied = Some(format!("{x},{y}"));
+      ui.close();
+    }
+    let [x, y] = menu.cursor;
+    if ui
+      .button(format!("Copy cursor  {}, {}", sig4(x), sig4(y)))
+      .clicked()
+    {
+      copied = Some(format!("{x},{y}"));
+      ui.close();
+    }
+    ui.separator();
+    ui.checkbox(legend, "Legend");
+    ui.add_enabled_ui(*legend, |ui| {
+      for (c, label) in [
+        (Corner::RightTop, "↗ Top right"),
+        (Corner::RightBottom, "↘ Bottom right"),
+        (Corner::LeftTop, "↖ Top left"),
+        (Corner::LeftBottom, "↙ Bottom left"),
+      ] {
+        ui.radio_value(corner, c, label);
       }
     });
+  });
   copied
 }
 
@@ -728,6 +763,7 @@ impl PlotApp {
       point_radius: 2.0,
       line_width: 1.5,
       legend: true,
+      legend_corner: Corner::RightTop,
       grid: true,
       max_points,
       fit_request: false,
@@ -1106,7 +1142,7 @@ impl PlotApp {
   /// The x–y plot, each series with its own geometry. On a log axis the values are drawn in log10.
   fn xy_plot(&mut self, ui: &mut egui::Ui, st: &PlotState, request: Option<bool>) {
     let (radius, width) = (self.point_radius, self.line_width);
-    let (legend, grid) = (self.legend, self.grid);
+    let (legend, grid, corner) = (self.legend, self.grid, self.legend_corner);
     let [log_x, log_y, _] = self.log;
     let (series, starts, dropped) = mapped_series(&mut self.log_cache, st, [log_x, log_y]);
     let name = &self.name;
@@ -1137,7 +1173,7 @@ impl PlotApp {
           (!menu_open).then(|| hover_text(pos, [log_x, log_y]))
         });
       if legend {
-        plot = plot.legend(Legend::default());
+        plot = plot.legend(Legend::default().position(corner));
       }
       if log_x {
         plot = plot
@@ -1231,8 +1267,14 @@ impl PlotApp {
       if total == 0 {
         paint_waiting(ui, response.response.rect, name);
       }
-      if response.response.secondary_clicked() {
-        frozen = copy_snapshot(&response, st, snapped.take(), [log_x, log_y]);
+      if let Some(at) = right_click_at(ui, &response.response) {
+        frozen = Some(copy_snapshot(
+          &response,
+          at,
+          st,
+          snapped.take(),
+          [log_x, log_y],
+        ));
       }
       plot_response = Some(response.response);
     });
@@ -1258,7 +1300,7 @@ impl PlotApp {
       Some(h) => bar_charts(h, layout, &st.series, log_y),
       None => Vec::new(),
     };
-    let (legend, grid) = (self.legend, self.grid);
+    let (legend, grid, corner) = (self.legend, self.grid, self.legend_corner);
     let name = &self.name;
     let total = st.total_points();
     let x_label = if st.y_label.is_empty() {
@@ -1291,7 +1333,7 @@ impl PlotApp {
           .y_axis_formatter(log_axis_label);
       }
       if legend {
-        plot = plot.legend(Legend::default());
+        plot = plot.legend(Legend::default().position(corner));
       }
       let response = plot.show(ui, |plot_ui| {
         follow = Some(apply_follow(plot_ui, request).any());
@@ -1303,8 +1345,8 @@ impl PlotApp {
       if total == 0 {
         paint_waiting(ui, response.response.rect, name);
       }
-      if response.response.secondary_clicked() {
-        frozen = copy_snapshot(&response, st, None, [log_x, log_y]);
+      if let Some(at) = right_click_at(ui, &response.response) {
+        frozen = Some(copy_snapshot(&response, at, st, None, [log_x, log_y]));
       }
       plot_response = Some(response.response);
     });
@@ -1388,13 +1430,20 @@ impl PlotApp {
   /// Freezes the copy menu on the right click that gave `frozen`, then shows it over the plot
   /// `response` while it is open. A copy puts its text on the clipboard and starts the note.
   fn update_copy_menu(&mut self, response: &egui::Response, frozen: Option<CopyMenu>) {
+    let open = frozen.is_some();
     if let Some(menu) = frozen {
       self.copy_menu = Some(menu);
     }
     let Some(menu) = &self.copy_menu else {
       return;
     };
-    if let Some(text) = copy_menu_items(response, menu) {
+    if let Some(text) = copy_menu_items(
+      response,
+      menu,
+      open,
+      &mut self.legend,
+      &mut self.legend_corner,
+    ) {
       self.copy_note = Some(CopyNote {
         at: menu.at,
         text: format!("Copied {text}"),
