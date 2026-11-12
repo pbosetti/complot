@@ -111,9 +111,48 @@ fn push_m4(run: &[PlotPoint], out: &mut Vec<PlotPoint>) {
   }
 }
 
+/// Reduces a line in any x order, keeping its data order: a point is kept when it is at least
+/// `gap` from the last kept one, with x and y measured in units of `unit` (plot units per screen
+/// point). The last point is always kept, so the line ends where the data does.
+///
+/// shortcut: no clipping to the view and no upper bound on the output, so a long line that
+/// moves a pixel per point stays long; upgrade if such series get slow to draw.
+pub fn decimate_path(points: &[PlotPoint], unit: [f64; 2], gap: f64) -> Vec<PlotPoint> {
+  let mut kept: Vec<PlotPoint> = Vec::new();
+  for (i, p) in points.iter().enumerate() {
+    let far = kept
+      .last()
+      .is_none_or(|k| ((p.x - k.x) / unit[0]).hypot((p.y - k.y) / unit[1]) >= gap);
+    if far || i + 1 == points.len() {
+      kept.push(*p);
+    }
+  }
+  kept
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn decimate_path_keeps_data_order_and_drops_close_points() {
+    let pts: Vec<PlotPoint> = [[0.0, 0.0], [0.1, 0.0], [2.0, 0.0], [1.0, 0.0], [1.05, 0.0]]
+      .map(|[x, y]| PlotPoint::new(x, y))
+      .to_vec();
+    let kept: Vec<f64> = decimate_path(&pts, [1.0, 1.0], 0.5)
+      .iter()
+      .map(|p| p.x)
+      .collect();
+    assert_eq!(kept, [0.0, 2.0, 1.0, 1.05]);
+    // y is measured in its own unit.
+    let tall = [
+      PlotPoint::new(0.0, 0.0),
+      PlotPoint::new(0.0, 0.4),
+      PlotPoint::new(0.0, 0.8),
+    ];
+    assert_eq!(decimate_path(&tall, [1.0, 0.1], 5.0).len(), 2);
+    assert!(decimate_path(&[], [1.0, 1.0], 0.5).is_empty());
+  }
 
   /// A point at (x, y).
   fn pt(x: f64, y: f64) -> PlotPoint {

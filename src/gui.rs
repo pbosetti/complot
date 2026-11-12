@@ -1,7 +1,7 @@
 //! The plot window: a side panel with settings and the plot itself.
 
 use crate::hist::{self, BinRule, Histogram};
-use crate::lod::{decimate_line, decimate_points};
+use crate::lod::{decimate_line, decimate_path, decimate_points};
 use crate::model::{Geom, Kind, PlotState, Series};
 use crate::scale::{log_label, log_ticks, to_log};
 use crate::view3d::{Series3d, View3d};
@@ -18,6 +18,8 @@ use std::time::Duration;
 
 /// Series with more points than this are decimated to what fits on screen.
 const LOD_MIN: usize = 5_000;
+/// Screen points between the kept points of a large unsorted line.
+const MIN_PATH_GAP: f64 = 0.5;
 
 /// Ids of the x–y and histogram plots. Fixed, so that the tests can read their transforms.
 const XY_PLOT_ID: &str = "complot_plot";
@@ -1209,11 +1211,14 @@ impl PlotApp {
         let cols = (frame.width() / cell).round().max(1.0) as usize;
         let rows = (frame.height() / cell).round().max(1.0) as usize;
 
-        // A large unsorted series is drawn as points only: its line can only
-        // be decimated in x order, and in full it is an unreadable tangle.
         let big = |s: &Series| s.points.len() > LOD_MIN;
-        let as_line = |s: &Series| has_lines(st.geom_of(&s.name)) && (s.sorted || !big(s));
-        let as_points = |s: &Series| has_points(st.geom_of(&s.name)) || !as_line(s);
+        let as_line = |s: &Series| has_lines(st.geom_of(&s.name));
+        let as_points = |s: &Series| has_points(st.geom_of(&s.name));
+        // Plot units per screen point, for the line of a large unsorted series.
+        let unit = [
+          (max[0] - min[0]) / f64::from(frame.width().max(1.0)),
+          (max[1] - min[1]) / f64::from(frame.height().max(1.0)),
+        ];
 
         // Per series, the marks drawn for it (line points or markers, whichever more).
         let mut marks = vec![0; series.len()];
@@ -1229,7 +1234,12 @@ impl PlotApp {
           for run in runs(pts, starts.get(i).map_or(&[], Vec::as_slice)) {
             let line = match range {
               Some([x0, x1, _, _]) => {
-                let kept = decimate_line(run, x0, x1, columns);
+                // M4 needs x order; an unsorted line is thinned in data order instead.
+                let kept = if s.sorted {
+                  decimate_line(run, x0, x1, columns)
+                } else {
+                  decimate_path(run, unit, MIN_PATH_GAP)
+                };
                 any_decimated = true;
                 marks[i] += kept.len();
                 Line::new(s.name.as_str(), PlotPoints::Owned(kept))
@@ -2061,8 +2071,8 @@ mod tests {
   #[test]
   fn xy_frames_draw_each_series_with_its_own_geometry() {
     let (ctx, mut app) = app_with(|st| {
-      // Long and sorted, so that its line is decimated; long and unsorted, so that it is
-      // drawn as points only.
+      // Long and sorted, so that its line is decimated by M4; long and unsorted, so that its
+      // line is decimated in data order.
       for i in 0..6000 {
         let t = i as f64;
         st.push_point("sorted", None, (t * 0.01).sin(), None)
