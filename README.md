@@ -174,10 +174,12 @@ settings, and the last change wins.
 `hist` always applies to the whole plot, since a histogram's axes (value and
 count) can't be shared with x–y series. All groups share the same bins, by
 Sturges' rule unless the panel switches to Scott's; the panel also chooses
-between side-by-side and stacked bars, and between counts and densities. A
-density is the count over the number of values and the bin width, so that each
-series has unit area side by side, and the whole stack has unit area when
-stacked. With a buffer limit, the histogram
+between side-by-side and stacked bars, and among counts, densities and
+probabilities. A density is the count over the number of values and the bin
+width, so that the bars have unit area; a probability is the count over the
+number of values, so that the bars add up to 1. Side by side, each series is
+scaled on its own values; stacked, on the values of all series, so that the
+whole stack has unit area or sum. With a buffer limit, the histogram
 covers a rolling window of the latest values.
 
 A plot can only switch to `3dl` or `3dp` when every series has z values, and a
@@ -238,13 +240,13 @@ few graphical settings:
 - **Kind**: x–y, histogram or 3D (3D is greyed out until every series has z).
 - **All series** and **Series**: the geometry of every series at once, or of
   each one (points, lines, both), plus point size and line width.
-- **Histogram**: Sturges or Scott bins, side-by-side or stacked bars, count or
-  density heights.
+- **Histogram**: Sturges or Scott bins, side-by-side or stacked bars, count, density
+  or probability heights.
 - **3D**: perspective on or off, reset view. Drag rotates, scroll zooms,
   double-click resets; a click on a legend entry hides its series.
 - **Scale**: log x, log y and, in 3D, log z. Ticks sit at the decades and read
   as values (1, 10, 100, 1e5). In a histogram, log x bins the logarithm of the
-  values and log y puts the counts (or densities) on a log axis. Values ≤ 0 can't be shown on
+  values and log y puts the bar heights on a log axis. Values ≤ 0 can't be shown on
   a log axis; they are left out and counted in the status line.
 - Legend, grid, follow (auto-fit while data arrives), a per-series buffer
   limit for rolling windows, clearing the data and copying it as CSV.
