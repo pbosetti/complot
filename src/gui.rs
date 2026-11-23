@@ -195,6 +195,8 @@ struct PlotApp {
   /// Bin rule of a histogram.
   bin_rule: BinRule,
   hist_layout: HistLayout,
+  /// Whether a histogram shows densities rather than counts.
+  hist_density: bool,
   /// The histogram of the data, shared by the status line and the plot.
   hist_cache: Option<HistCache>,
   /// Log scale of the x, y and z axes.
@@ -447,19 +449,21 @@ fn runs<'a>(points: &'a [PlotPoint], starts: &[usize]) -> impl Iterator<Item = &
   (0..bounds.len() - 1).map(move |k| &points[bounds[k]..bounds[k + 1]])
 }
 
-/// Bars of group `group` of `groups` in each bin of `h`, as (argument, width, height).
+/// Bars of group `group` of `groups` in each bin of `h`, as (argument, width, height). The
+/// heights are `heights[group]`, from [`Histogram::heights`].
 ///
 /// Side by side, the bars of a bin share 90% of its width, one slot per group. Stacked, each
 /// bar is centred on its bin, 90% wide. Zero-height bars are kept, so that bars pair by index.
 fn bar_layout(
   h: &Histogram,
+  heights: &[Vec<f64>],
   layout: HistLayout,
   group: usize,
   groups: usize,
 ) -> Vec<(f64, f64, f64)> {
   (0..h.bins())
     .map(|b| {
-      let height = h.counts[group][b] as f64;
+      let height = heights[group][b];
       match layout {
         HistLayout::Side => {
           let bar_w = 0.9 * h.width / groups.max(1) as f64;
@@ -472,35 +476,41 @@ fn bar_layout(
     .collect()
 }
 
-/// Bars of group `group` of `groups` when the counts are on a log axis, as (argument, width,
-/// base, height). A count c ≥ 1 rises from zero to log10(c), and a count of 0 draws no bar, so it
-/// is left out. Stacked, log heights do not add up: the bar of group g spans log10 of the
-/// cumulative counts of the groups before it (zero below the first) up to log10 of those with g.
+/// Bars of group `group` of `groups` when the heights are on a log axis, as (argument, width,
+/// base, height). A log axis has no zero, so the bars rise from the floor: the decade at or below
+/// the smallest positive height, and no higher than 1 (so that counts rise from log 1 = 0). A
+/// height v > 0 rises from the floor to log10(v), and a height of 0 draws no bar, so it is left
+/// out. Stacked, log heights do not add up: the bar of group g spans log10 of the cumulative
+/// heights of the groups before it (the floor below the first) up to log10 of those with g.
 /// Arguments and widths are those of [`bar_layout`].
 fn log_bars(
   h: &Histogram,
+  heights: &[Vec<f64>],
   layout: HistLayout,
   group: usize,
   groups: usize,
 ) -> Vec<(f64, f64, f64, f64)> {
-  bar_layout(h, layout, group, groups)
+  let floor = heights
+    .iter()
+    .flatten()
+    .copied()
+    .filter(|&v| v > 0.0)
+    .fold(1.0_f64, f64::min)
+    .log10()
+    .floor();
+  bar_layout(h, heights, layout, group, groups)
     .into_iter()
     .enumerate()
-    .filter_map(|(b, (arg, width, _))| {
-      let count = h.counts[group][b];
-      if count == 0 {
+    .filter_map(|(b, (arg, width, value))| {
+      if value <= 0.0 {
         return None;
       }
       let (base, top) = match layout {
-        HistLayout::Side => (0.0, (count as f64).log10()),
+        HistLayout::Side => (floor, value.log10()),
         HistLayout::Stack => {
-          let below: u64 = h.counts[..group].iter().map(|c| c[b]).sum();
-          let base = if below == 0 {
-            0.0
-          } else {
-            (below as f64).log10()
-          };
-          (base, ((below + count) as f64).log10())
+          let below: f64 = heights[..group].iter().map(|c| c[b]).sum();
+          let base = if below > 0.0 { below.log10() } else { floor };
+          (base, (below + value).log10())
         }
       };
       Some((arg, width, base, top - base))
@@ -508,16 +518,25 @@ fn log_bars(
     .collect()
 }
 
-/// One bar chart per series, in series order. In a stack, each chart sits on the ones before it,
-/// unless the counts are on a log axis: then each bar is placed by [`log_bars`].
-fn bar_charts(h: &Histogram, layout: HistLayout, series: &[Series], log_y: bool) -> Vec<BarChart> {
+/// One bar chart per series, in series order, of counts or, if `density`, of densities (per
+/// series side by side, pooled when stacked, so that the stack has unit area). In a stack, each
+/// chart sits on the ones before it, unless the heights are on a log axis: then each bar is placed
+/// by [`log_bars`].
+fn bar_charts(
+  h: &Histogram,
+  layout: HistLayout,
+  density: bool,
+  series: &[Series],
+  log_y: bool,
+) -> Vec<BarChart> {
+  let heights = h.heights(density, layout == HistLayout::Stack);
   let mut charts: Vec<BarChart> = Vec::with_capacity(series.len());
   for (g, s) in series.iter().enumerate() {
     let color = palette(g);
     // egui_plot's default fill is 20% opaque, too faint to tell stacked bars apart.
     let (fill, stroke) = (color.gamma_multiply(0.6), egui::Stroke::new(1.0, color));
     let bars: Vec<Bar> = if log_y {
-      log_bars(h, layout, g, series.len())
+      log_bars(h, &heights, layout, g, series.len())
         .into_iter()
         .map(|(arg, width, base, height)| {
           Bar::new(arg, height)
@@ -528,7 +547,7 @@ fn bar_charts(h: &Histogram, layout: HistLayout, series: &[Series], log_y: bool)
         })
         .collect()
     } else {
-      bar_layout(h, layout, g, series.len())
+      bar_layout(h, &heights, layout, g, series.len())
         .into_iter()
         .map(|(arg, width, height)| Bar::new(arg, height).width(width).fill(fill).stroke(stroke))
         .collect()
@@ -777,6 +796,7 @@ impl PlotApp {
       settings_open: true,
       bin_rule: BinRule::default(),
       hist_layout: HistLayout::Side,
+      hist_density: false,
       hist_cache: None,
       log: [false; 3],
       log_cache: None,
@@ -1057,7 +1077,8 @@ impl PlotApp {
     });
   }
 
-  /// The "Histogram" group: the bin rule, the bar layout and the number of bins.
+  /// The "Histogram" group: the bin rule, the bar layout, counts or densities and the number of
+  /// bins.
   fn histogram_group(&mut self, ui: &mut egui::Ui, bins: usize) {
     ui.group(|ui| {
       ui.label(egui::RichText::new("Histogram").strong());
@@ -1067,6 +1088,9 @@ impl PlotApp {
       ui.label(egui::RichText::new("Bars").small().weak());
       ui.radio_value(&mut self.hist_layout, HistLayout::Side, "side by side");
       ui.radio_value(&mut self.hist_layout, HistLayout::Stack, "stacked");
+      ui.label(egui::RichText::new("Height").small().weak());
+      ui.radio_value(&mut self.hist_density, false, "count");
+      ui.radio_value(&mut self.hist_density, true, "density");
       ui.label(format!("{bins} bins"));
     });
   }
@@ -1303,11 +1327,11 @@ impl PlotApp {
   /// binned in log10, and log counts are drawn as log10 heights.
   fn hist_plot(&mut self, ui: &mut egui::Ui, st: &PlotState, request: Option<bool>) {
     let [log_x, log_y, _] = self.log;
-    let layout = self.hist_layout;
+    let (layout, density) = (self.hist_layout, self.hist_density);
     // The values are the y of the data, so the mapping of the histogram is on y.
     let (series, _, dropped) = mapped_series(&mut self.log_cache, st, [false, log_x]);
     let charts = match cached_histogram(&mut self.hist_cache, self.bin_rule, log_x, st, series) {
-      Some(h) => bar_charts(h, layout, &st.series, log_y),
+      Some(h) => bar_charts(h, layout, density, &st.series, log_y),
       None => Vec::new(),
     };
     let (legend, grid, corner) = (self.legend, self.grid, self.legend_corner);
@@ -1319,7 +1343,7 @@ impl PlotApp {
       st.y_label.as_str()
     };
     let x_title = axis_title(x_label, log_x);
-    let y_title = axis_title("count", log_y);
+    let y_title = axis_title(if density { "density" } else { "count" }, log_y);
     let mut follow: Option<bool> = None;
     let mut plot_response = None;
     let mut frozen = None;
@@ -2164,7 +2188,13 @@ mod tests {
     };
     let mut bins: Vec<Vec<(f64, f64)>> = vec![Vec::new(); h.bins()];
     for (g, group) in counts.iter().enumerate() {
-      let bars = bar_layout(&h, HistLayout::Side, g, counts.len());
+      let bars = bar_layout(
+        &h,
+        &h.heights(false, false),
+        HistLayout::Side,
+        g,
+        counts.len(),
+      );
       assert_eq!(bars.len(), h.bins());
       for (b, &(arg, width, height)) in bars.iter().enumerate() {
         assert_eq!(height, group[b] as f64, "height of group {g} in bin {b}");
@@ -2200,7 +2230,13 @@ mod tests {
       counts: counts.clone(),
     };
     for (g, group) in counts.iter().enumerate() {
-      let bars = bar_layout(&h, HistLayout::Stack, g, counts.len());
+      let bars = bar_layout(
+        &h,
+        &h.heights(false, true),
+        HistLayout::Stack,
+        g,
+        counts.len(),
+      );
       assert_eq!(bars.len(), h.bins());
       for (b, &(arg, width, height)) in bars.iter().enumerate() {
         assert!(
@@ -2354,13 +2390,13 @@ mod tests {
     };
     // Group 0 rises from zero to log 1 in bin 1 and to log 4 in bin 2. Bin 0 is left out.
     assert_bars(
-      &log_bars(&h, HistLayout::Stack, 0, 2),
+      &log_bars(&h, &h.heights(false, true), HistLayout::Stack, 0, 2),
       &[(1.5, 0.9, 0.0, 0.0), (2.5, 0.9, 0.0, 4f64.log10())],
     );
     // Group 1 rises from zero to log 5 in bin 0. In bin 2 it sits on log 4 and reaches log 8,
     // and in bin 3 it rises from zero to log 3. Bin 1 is left out.
     assert_bars(
-      &log_bars(&h, HistLayout::Stack, 1, 2),
+      &log_bars(&h, &h.heights(false, true), HistLayout::Stack, 1, 2),
       &[
         (0.5, 0.9, 0.0, 5f64.log10()),
         (2.5, 0.9, 4f64.log10(), 2f64.log10()),
@@ -2379,12 +2415,29 @@ mod tests {
     // Two groups: bars 0.45 wide, the first at 0.05 + 0.5 * 0.45 into the bin, the second at
     // 0.05 + 1.5 * 0.45.
     assert_bars(
-      &log_bars(&h, HistLayout::Side, 0, 2),
+      &log_bars(&h, &h.heights(false, false), HistLayout::Side, 0, 2),
       &[(1.275, 0.45, 0.0, 0.0), (2.275, 0.45, 0.0, 1.0)],
     );
     assert_bars(
-      &log_bars(&h, HistLayout::Side, 1, 2),
+      &log_bars(&h, &h.heights(false, false), HistLayout::Side, 1, 2),
       &[(0.725, 0.45, 0.0, 3f64.log10()), (2.725, 0.45, 0.0, 2.0)],
+    );
+  }
+
+  #[test]
+  fn log_bars_of_densities_rise_from_the_decade_below_the_smallest() {
+    // Four values in bins of width 1: densities 0.25 and 0.75, so the floor is log 0.1 = -1.
+    let h = Histogram {
+      start: 0.0,
+      width: 1.0,
+      counts: vec![vec![1, 0, 3]],
+    };
+    assert_bars(
+      &log_bars(&h, &h.heights(true, false), HistLayout::Side, 0, 1),
+      &[
+        (0.5, 0.9, -1.0, 0.25f64.log10() + 1.0),
+        (2.5, 0.9, -1.0, 0.75f64.log10() + 1.0),
+      ],
     );
   }
 

@@ -36,6 +36,31 @@ impl Histogram {
   pub fn center(&self, b: usize) -> f64 {
     self.start + (b as f64 + 0.5) * self.width
   }
+
+  /// `heights[g][b]`: the counts as plain numbers, or as densities if `density`.
+  ///
+  /// A density is the count over the number of values times the bin width. With `pooled` false
+  /// the number of values is that of each group, so that every group's bars have unit area; with
+  /// `pooled` true it is that of all groups together, so that the bars of all groups, stacked,
+  /// have unit area. A group with no values has zero density.
+  pub fn heights(&self, density: bool, pooled: bool) -> Vec<Vec<f64>> {
+    let total: u64 = self.counts.iter().flatten().sum();
+    self
+      .counts
+      .iter()
+      .map(|c| {
+        let n = if pooled { total } else { c.iter().sum() };
+        let scale = if !density {
+          1.0
+        } else if n == 0 {
+          0.0
+        } else {
+          1.0 / (n as f64 * self.width)
+        };
+        c.iter().map(|&k| k as f64 * scale).collect()
+      })
+      .collect()
+  }
 }
 
 /// Bins the y values of all `groups` together, so that they share the same
@@ -263,6 +288,32 @@ mod tests {
     assert_eq!(h.counts[1], vec![0; 4]);
     assert_eq!(h.counts[2], vec![0; 4]);
     assert_eq!(h.counts[3], vec![0, 0, 0, 1]);
+  }
+
+  #[test]
+  fn densities_have_unit_area() {
+    let h = Histogram {
+      start: 0.0,
+      width: 0.5,
+      counts: vec![vec![1, 3, 0], vec![0, 0, 0], vec![2, 0, 2]],
+    };
+    let area = |v: &[f64]| v.iter().sum::<f64>() * h.width;
+    assert_eq!(
+      h.heights(false, false),
+      vec![vec![1.0, 3.0, 0.0], vec![0.0; 3], vec![2.0, 0.0, 2.0]]
+    );
+    let each = h.heights(true, false);
+    assert_eq!(each[0], vec![0.5, 1.5, 0.0]);
+    assert_eq!(each[1], vec![0.0; 3]);
+    assert_eq!(each[2], vec![1.0, 0.0, 1.0]);
+    assert!((area(&each[0]) - 1.0).abs() < 1e-12);
+    assert!((area(&each[2]) - 1.0).abs() < 1e-12);
+    // Eight values in all: each count weighs 1 / (8 * 0.5).
+    let pooled = h.heights(true, true);
+    assert_eq!(pooled[0], vec![0.25, 0.75, 0.0]);
+    assert_eq!(pooled[2], vec![0.5, 0.0, 0.5]);
+    let total: f64 = pooled.iter().map(|v| area(v)).sum();
+    assert!((total - 1.0).abs() < 1e-12);
   }
 
   #[test]
